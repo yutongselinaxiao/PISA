@@ -446,7 +446,7 @@ class CIFAR10_truncated(data.Dataset):
 
     def __build_truncated_dataset__(self):
 
-        #cifar_dataobj = CIFAR10(self.root, self.train, self.transform, self.target_transform, self.download)
+        # cifar_dataobj = CIFAR10(self.root, self.train, self.transform, self.target_transform, self.download)
         cifar_dataobj = CIFAR10(self.root, self.train, self.transform, self.target_transform,download=False)
 
         data = cifar_dataobj.data
