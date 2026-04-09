@@ -169,25 +169,25 @@ def online_convex_bal_update_u(
     eps=1e-12,
 ):
     """
-    Online update on u = log(rho) using convex-bal target tracking:
-        L(u) = (u - (log r - log delta_y))^2
+    Per-client projected OGD on u = log(sigma), using the proof-style balance loss
 
-    Args:
-        u:          scalar torch tensor, current u = log(rho)
-        primal_res: scalar torch tensor
-        delta_y:    scalar torch tensor, ||y^{k+1} - y^k||
+        ell_k(u) = 0.5 * (u - a_k)^2
+        a_k = log(primal_res) - log(delta_y)
+
+    where delta_y is the pre-sigma dual-side quantity (dual_base).
     """
     r_clip = torch.clamp(primal_res, min=eps)
     dy_clip = torch.clamp(delta_y, min=eps)
 
-    target = torch.log(r_clip) - torch.log(dy_clip)
-    grad_u = 2.0 * (u - target)
+    # target = torch.log(r_clip) - torch.log(dy_clip)
+    target = -torch.log(r_clip) + torch.log(dy_clip)
+    grad_u = u - target                  # exact gradient of 0.5 * (u - target)^2
     grad_u = torch.clamp(grad_u, -G_clip, G_clip)
 
     with torch.no_grad():
         u_new = u - eta_u * grad_u
         u_new = torch.clamp(u_new, min=u_min, max=u_max)
-        loss_val = (u - target).pow(2)
+        loss_val = 0.5 * (u - target).pow(2)
 
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
 
@@ -337,7 +337,7 @@ def get_args():
 
     # adaptive sigma mode
     parser.add_argument('--sigma_mode', type=str, default='fixed',
-                        choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal', 'online_hybrid'],
+                        choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal', 'online_convex_bal_denug', 'online_hybrid'],
                         help='sigma update mode for sisa')
 
     parser.add_argument('--sigma_min', type=float, default=1e-6,
@@ -1180,6 +1180,7 @@ if __name__ == '__main__':
 
         wandb.init(
             project=args.wandb_project,
+            # dir="/data/yutong/wandb",
             entity=args.wandb_entity,
             name=args.wandb_run_name,
             group=args.wandb_group,
@@ -1499,17 +1500,30 @@ if __name__ == '__main__':
                         param_wn.copy_(delta.detach())
                         param_pn.add_(current_sigma * (param_wn - param_wg))
 
+                    # primal_res = global_norm([a - b for a, b in zip(W_n, W_global)])
+                    # dual_res = current_sigma * global_norm([a - b for a, b in zip(W_global, W_global_prev)])
+                    # delta_y = global_norm([a - b for a, b in zip(W_n, W_n_prev)])
+
+                    # primal_res_hist[sb] = primal_res.item()
+                    # dual_res_hist[sb] = dual_res.item()
+                    # delta_y_hist[sb] = delta_y.item()
+                
+                    # epoch_primal_res.append(primal_res.item())
+                    # epoch_dual_res.append(dual_res.item())
+                    # epoch_delta_y.append(delta_y.item())
+                    
                     primal_res = global_norm([a - b for a, b in zip(W_n, W_global)])
-                    dual_res = current_sigma * global_norm([a - b for a, b in zip(W_global, W_global_prev)])
-                    delta_y = global_norm([a - b for a, b in zip(W_n, W_n_prev)])
+                    # dual_base = global_norm([a - b for a, b in zip(W_global, W_global_prev)])
+                    dual_base = global_norm([a - b for a, b in zip(W_n, W_n_prev)])
+                    dual_res = current_sigma * dual_base
 
                     primal_res_hist[sb] = primal_res.item()
                     dual_res_hist[sb] = dual_res.item()
-                    delta_y_hist[sb] = delta_y.item()
+                    delta_y_hist[sb] = dual_base.item()   # keep the same container name if you want
 
                     epoch_primal_res.append(primal_res.item())
                     epoch_dual_res.append(dual_res.item())
-                    epoch_delta_y.append(delta_y.item())
+                    epoch_delta_y.append(dual_base.item())
 
                 # updated_iteration += 1
                 zero_grad(model.parameters())
@@ -1649,6 +1663,37 @@ if __name__ == '__main__':
                         sigma_loss_list.append(float(sigma_loss.item()))
                         sigma_target_list.append(float(sigma_target.item()))
                         sigma_grad_u_list.append(float(grad_u.item()))
+                elif sigma_mode == "online_convex_bal_debug" and ((epoch + 1) % sigma_update_freq == 0):
+                    for sb in range(args.n_parties):    
+                        old_u = u_sigma_b[sb].detach()
+                        eps_val = getattr(args, "eps", 1e-12)
+
+                        cur_primal = float(epoch_primal_res[sb])
+                        cur_delta_y = float(epoch_delta_y[sb])   # now this is dual_base
+
+                        u_new, sigma_loss, sigma_target, grad_u = online_convex_bal_update_u(
+                            u=old_u,
+                            primal_res=torch.tensor(cur_primal, device=device),
+                            delta_y=torch.tensor(cur_delta_y, device=device),
+                            eta_u=eta_u / math.sqrt(epoch + 1),
+                            G_clip=G_clip,
+                            u_min=math.log(sigma_min),
+                            u_max=math.log(sigma_max),
+                            eps=eps_val,
+                        )
+
+                        u_sigma_b[sb] = u_new.detach()
+                        sigma_b[sb] = float(torch.exp(u_sigma_b[sb]).item())
+
+                        # print(
+                        #     f"client {sb} "
+                        #     f"u={old_u.item():.4f} "
+                        #     f"sigma={math.exp(old_u.item()):.4e} "
+                        #     f"primal={cur_primal:.4e} "
+                        #     f"dual_base={cur_delta_y:.4e} "
+                        #     f"target={sigma_target.item():.4f} "
+                        #     f"grad={grad_u.item():.4f}"
+                        # )
                 elif sigma_mode == "online_hybrid" and ((epoch + 1) % sigma_update_freq == 0):
                     for sb in range(args.n_parties):
                         old_u = u_sigma_b[sb].detach()
@@ -1691,15 +1736,15 @@ if __name__ == '__main__':
 
                         with torch.no_grad():
                             # trust region
-                            max_delta_k = max(
-                                sigma_max_delta_min,
-                                sigma_max_delta / math.sqrt(epoch + 1)
-                            )
-                            u_candidate = torch.clamp(
-                                u_candidate,
-                                min=old_u - max_delta_k,
-                                max=old_u + max_delta_k,
-                            )
+                            # max_delta_k = max(
+                            #     sigma_max_delta_min,
+                            #     sigma_max_delta / math.sqrt(epoch + 1)
+                            # )
+                            # u_candidate = torch.clamp(
+                            #     u_candidate,
+                            #     min=old_u - max_delta_k,
+                            #     max=old_u + max_delta_k,
+                            # )
 
                             # damped blending
                             blend_k = max(
@@ -1747,7 +1792,12 @@ if __name__ == '__main__':
                     "sigma/avg": sum(alpha_b[i] * sigma_b[i] for i in range(args.n_parties)),
                     "sigma/min": min(sigma_b),
                     "sigma/max": max(sigma_b),
+                    
                 }
+                
+                log_dict[f"ratio_primal_over_dualbase/client_{i}"] = primal_res_hist[i] / max(delta_y_hist[i], 1e-12)
+                log_dict[f"log_ratio_primal_over_dualbase/client_{i}"] = math.log(max(primal_res_hist[i], 1e-12)) - math.log(max(delta_y_hist[i], 1e-12))
+                log_dict[f"target_exp/client_{i}"] = math.exp(sigma_target_list[i]) if i < len(sigma_target_list) else None
 
                 for i in range(args.n_parties):
                     log_dict[f"primal_res/client_{i}"] = primal_res_hist[i]
@@ -1756,6 +1806,10 @@ if __name__ == '__main__':
                     log_dict[f"sigma/client_{i}"] = sigma_b[i]
                     log_dict[f"log_sigma/client_{i}"] = math.log(max(sigma_b[i], 1e-12))
                     log_dict[f"sigma_change/client_{i}"] = sigma_b[i] - sigma_before_epoch[i]
+                    log_dict[f"primal_over_dualbase/client_{i}"] = primal_res_hist[i] / max(delta_y_hist[i], 1e-12)
+                    log_dict[f"log_primal_over_dualbase/client_{i}"] = math.log(max(primal_res_hist[i], 1e-12)) - math.log(max(delta_y_hist[i], 1e-12))
+                    log_dict[f"sigma_times_dualbase/client_{i}"] = sigma_b[i] * delta_y_hist[i]
+                    log_dict[f"primal_minus_sigma_dualbase/client_{i}"] = primal_res_hist[i] - sigma_b[i] * delta_y_hist[i]
 
                     if primal_res_ema[i] is not None:
                         log_dict[f"primal_res_ema/client_{i}"] = primal_res_ema[i]

@@ -48,76 +48,6 @@ def average_parameters(num_train_env, list_vars, list_alpha):
         sum_vars = [sum_ + alpha*update for sum_, update in zip(sum_vars, W_n)]
     return sum_vars
 
-def heuristic_update_sigma(sigma_old, primal_res, dual_res, mu=10.0, tau=2.0):
-    sigma_new = sigma_old
-    if primal_res > mu * dual_res:
-        sigma_new = sigma_old * tau
-    elif dual_res > mu * primal_res:
-        sigma_new = sigma_old / tau
-    return sigma_new
-
-def online_ogd_update_u(u, primal_res, dual_res, eta_u, G_clip, u_min, u_max, eps=1e-12):
-    target_u = torch.log(primal_res + eps) - torch.log(dual_res + eps)
-    loss = 0.5 * (u - target_u) ** 2
-    (g_u,) = torch.autograd.grad(loss, u, retain_graph=False, create_graph=False)
-    g_u = torch.clamp(g_u, -G_clip, G_clip)
-
-    with torch.no_grad():
-        u_new = torch.clamp(u - eta_u * g_u, min=u_min, max=u_max)
-
-    return u_new.detach(), loss.detach()
-
-def online_convex_bal_update_u(
-    u,
-    primal_res,
-    delta_y,
-    eta_u=0.05,
-    G_clip=10.0,
-    u_min=-20.0,
-    u_max=20.0,
-    eps=1e-12,
-):
-    """
-    Online update on u = log(rho) using convex-bal target tracking:
-        L(u) = (u - (log r - log delta_y))^2
-
-    Args:
-        u:          scalar torch tensor, current u = log(rho)
-        primal_res: scalar torch tensor
-        delta_y:    scalar torch tensor, ||y^{k+1} - y^k||
-    """
-    r_clip = torch.clamp(primal_res, min=eps)
-    dy_clip = torch.clamp(delta_y, min=eps)
-
-    target = torch.log(r_clip) - torch.log(dy_clip)
-    grad_u = 2.0 * (u - target)
-    grad_u = torch.clamp(grad_u, -G_clip, G_clip)
-
-    with torch.no_grad():
-        u_new = u - eta_u * grad_u
-        u_new = torch.clamp(u_new, min=u_min, max=u_max)
-        loss_val = (u - target).pow(2)
-
-    return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
-
-import math
-import torch
-
-def global_norm(tensors):
-    # tensors: list[Tensor] same shapes as params
-    # returns scalar tensor on same device
-    s = None
-    for t in tensors:
-        if t is None:
-            continue
-        v = t.detach()
-        val = (v * v).sum()
-        s = val if s is None else (s + val)
-    return torch.sqrt(s + 1e-12)
-
-def clip_scalar(x, lo, hi):
-    return torch.clamp(x, min=lo, max=hi)
-
 
 def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha, l2_lambda):
     W_n_avg = average_parameters(num_batches, W_n_list, alpha)
@@ -130,6 +60,14 @@ def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha, l2_lambda)
     #del P_n_avg
     #gc.collect()
     return W_n_avg
+
+def diff_global_norm(list_a, list_b):
+    total = None
+    for a, b in zip(list_a, list_b):
+        diff = (a.detach() - b.detach())
+        val = torch.sum(diff * diff)
+        total = val if total is None else total + val
+    return torch.sqrt(total)
 
 def zero_grad(params):
     """
@@ -180,136 +118,49 @@ def split_and_aggregate_minibatches(client_subsets, num_splits=10):
     return global_batches
 
 
-import argparse
-
-def str2bool(v):
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
-    else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
-
 def get_args():
     parser = argparse.ArgumentParser()
-
-    # basic
-    parser.add_argument('--model', type=str, default='mlp',
-                        help='neural network used in training')
-    parser.add_argument('--dataset', type=str, default='mnist',
-                        help='dataset used for training')
+    parser.add_argument('--model', type=str, default='mlp', help='neural network used in training')
+    parser.add_argument('--dataset', type=str, default='mnist', help='dataset used for training')
     parser.add_argument('--net_config', type=lambda x: list(map(int, x.split(', '))))
-    parser.add_argument('--partition', type=str, default='homo',
-                        help='the data partitioning strategy')
-    parser.add_argument('--batch-size', type=int, default=64,
-                        help='input batch size for training')
-    parser.add_argument('--lr', type=float, default=0.01,
-                        help='learning rate')
-    parser.add_argument('--epochs', type=int, default=5,
-                        help='number of local epochs')
-    parser.add_argument('--n_parties', type=int, default=2,
-                        help='number of workers in a distributed cluster')
+    parser.add_argument('--partition', type=str, default='homo', help='the data partitioning strategy')
+    parser.add_argument('--batch-size', type=int, default=64, help='input batch size for training (default: 64)')
+    parser.add_argument('--lr', type=float, default=0.01, help='learning rate (default: 0.01)')
+    parser.add_argument('--epochs', type=int, default=5, help='number of local epochs')
+    parser.add_argument('--n_parties', type=int, default=2,  help='number of workers in a distributed cluster')
     parser.add_argument('--alg', type=str, default='fedavg',
-                        help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon/sisa')
-    parser.add_argument('--use_projection_head', type=str2bool, default=False,
-                        help='whether add an additional header to model or not (see MOON)')
-    parser.add_argument('--out_dim', type=int, default=256,
-                        help='the output dimension for the projection layer')
-    parser.add_argument('--loss', type=str, default='contrastive',
-                        help='loss type for moon')
-    parser.add_argument('--temperature', type=float, default=0.5,
-                        help='temperature parameter for contrastive loss')
-    parser.add_argument('--comm_round', type=int, default=50,
-                        help='number of maximum communication rounds')
-    parser.add_argument('--is_same_initial', type=int, default=1,
-                        help='whether initial all the models with the same parameters in fedavg')
-    parser.add_argument('--init_seed', type=int, default=0,
-                        help='random seed')
-    parser.add_argument('--dropout_p', type=float, default=0.0,
-                        help='dropout probability')
-    parser.add_argument('--datadir', type=str, default='/data/yutong/datasets',
-                        help='data directory')
-    parser.add_argument('--reg', type=float, default=1e-5,
-                        help='L2 regularization strength')
-    parser.add_argument('--logdir', type=str, default='./logs/',
-                        help='log directory path')
-    parser.add_argument('--modeldir', type=str, default='./models/',
-                        help='model directory path')
-    parser.add_argument('--beta', type=float, default=0.5,
-                        help='parameter for the dirichlet distribution for data partitioning')
-    parser.add_argument('--device', type=str, default='cuda:0',
-                        help='device to run the program')
-    parser.add_argument('--log_file_name', type=str, default=None,
-                        help='log file name')
-    parser.add_argument('--optimizer', type=str, default='sgd',
-                        help='optimizer')
-    parser.add_argument('--mu', type=float, default=0.001,
-                        help='mu parameter for fedprox')
-    parser.add_argument('--noise', type=float, default=0,
-                        help='how much noise we add to some party')
-    parser.add_argument('--noise_type', type=str, default='level',
-                        help='different level of noise or different space of noise')
-    parser.add_argument('--rho', type=float, default=0,
-                        help='parameter controlling the momentum SGD')
-    parser.add_argument('--sample', type=float, default=1,
-                        help='sample ratio for each communication round')
-
-    # sisa / ADMM-style params
-    parser.add_argument('--sigma_lr', type=float, default=1.5e0,
-                        help='hyperparameter sigma in sisa')
-    parser.add_argument('--rho_lr', type=float, default=1e3,
-                        help='initial rho in sisa')
-    parser.add_argument('--l2_lambda', type=float, default=1e-3,
-                        help='hyperparameter l2_lambda in sisa')
-    parser.add_argument('--mu_lr', type=float, default=0.997,
-                        help='sigma decay factor in sisa')
-    parser.add_argument('--decay_epoch', type=int, default=5,
-                        help='epoch interval for sigma decay in sisa')
-    parser.add_argument('--terminate_decay', type=int, default=50,
-                        help='stop sigma decay after this epoch in sisa')
-
-    # adaptive rho mode
-    parser.add_argument('--sigma_mode', type=str, default='fixed',
-                    choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal'],
-                    help='sigma update mode for sisa')
-
-    parser.add_argument('--sigma_min', type=float, default=1e-6,
-                        help='minimum allowed sigma')
-    parser.add_argument('--sigma_max', type=float, default=1e6,
-                        help='maximum allowed sigma')
-
-    # heuristic sigma update
-    parser.add_argument('--sigma_mu', type=float, default=10.0,
-                        help='residual balancing threshold mu')
-    parser.add_argument('--sigma_tau', type=float, default=2.0,
-                        help='residual balancing multiplier tau')
-
-    # online OGD update on u = log(rho)
-    parser.add_argument('--eta_u', type=float, default=0.05,
-                        help='step size for online OGD update of u=log(sigma)')
-    parser.add_argument('--G_clip', type=float, default=10.0,
-                        help='gradient clipping threshold for u update')
-
-    # numerical stability
-    parser.add_argument('--eps', type=float, default=1e-8,
-                        help='numerical stability epsilon')
-
-    # wandb
-    parser.add_argument('--use_wandb', type=str2bool, default=False,
-                        help='whether to log metrics to wandb')
-    parser.add_argument('--wandb_project', type=str, default='federated-learning',
-                        help='wandb project name')
-    parser.add_argument('--wandb_entity', type=str, default=None,
-                        help='wandb entity or team name')
-    parser.add_argument('--wandb_run_name', type=str, default=None,
-                        help='wandb run name')
-    parser.add_argument('--wandb_group', type=str, default=None,
-                        help='wandb group name')
-    parser.add_argument('--wandb_job_type', type=str, default='train',
-                        help='wandb job type')
-
+                            help='fl algorithms: fedavg/fedprox/scaffold/fednova/moon')
+    parser.add_argument('--use_projection_head', type=bool, default=False, help='whether add an additional header to model or not (see MOON)')
+    parser.add_argument('--out_dim', type=int, default=256, help='the output dimension for the projection layer')
+    parser.add_argument('--loss', type=str, default='contrastive', help='for moon')
+    parser.add_argument('--temperature', type=float, default=0.5, help='the temperature parameter for contrastive loss')
+    parser.add_argument('--comm_round', type=int, default=50, help='number of maximum communication roun')
+    parser.add_argument('--is_same_initial', type=int, default=1, help='Whether initial all the models with the same parameters in fedavg')
+    parser.add_argument('--init_seed', type=int, default=0, help="Random seed")
+    parser.add_argument('--dropout_p', type=float, required=False, default=0.0, help="Dropout probability. Default=0.0")
+    parser.add_argument('--datadir', type=str, required=False, default="./data/", help="Data directory")
+    parser.add_argument('--reg', type=float, default=1e-5, help="L2 regularization strength")
+    parser.add_argument('--logdir', type=str, required=False, default="./logs/", help='Log directory path')
+    parser.add_argument('--modeldir', type=str, required=False, default="./models/", help='Model directory path')
+    parser.add_argument('--beta', type=float, default=0.5, help='The parameter for the dirichlet distribution for data partitioning')
+    parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
+    parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
+    parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
+    parser.add_argument('--mu', type=float, default=0.001, help='the mu parameter for fedprox')
+    parser.add_argument('--noise', type=float, default=0, help='how much noise we add to some party')
+    parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
+    parser.add_argument('--rho', type=float, default=0, help='Parameter controlling the momentum SGD')
+    parser.add_argument('--sample', type=float, default=1, help='Sample ratio for each communication round')
+    parser.add_argument('--sigma_lr', type=float, default=1.5e0, help='hyperparameter sigma in sisa')
+    parser.add_argument('--rho_lr', type=float, default=1e3, help='hyperparameter rho in sisa')
+    parser.add_argument('--l2_lambda', type=float, default=1e-3, help='hyperparameter l2_lambda in sisa')
+    parser.add_argument('--mu_lr', type=float, default=0.997, help='hyperparameter mu in sisa')
+    parser.add_argument('--decay_epoch', type=float, default=5, help='hyperparameter decay_epoch in sisa')
+    parser.add_argument('--terminate_decay', type=float, default=50, help='hyperparameter stop sigma decay in sisa')
+    parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
+    parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
+    parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
+    parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
     args = parser.parse_args()
     return args
 
@@ -1076,25 +927,26 @@ if __name__ == '__main__':
     logger = logging.getLogger()
     logger.setLevel(logging.DEBUG)
     logger.info(device)
-    
-    if args.use_wandb:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project,
-            # dir="/data/yutong/wandb",
-            entity=args.wandb_entity,
-            name=args.wandb_run_name,
-            group=args.wandb_group,
-            job_type=args.wandb_job_type,
-            config=vars(args)
-        )
 
     seed = args.init_seed
     #logger.info("#" * 100)
     np.random.seed(seed)
     torch.manual_seed(seed)
     random.seed(seed)
+
+    wandb_run = None
+    if args.use_wandb:
+        if args.wandb_run_name is None:
+            args.wandb_run_name = f"{args.alg}-{args.dataset}-seed{args.init_seed}"
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            # dir="/data/yutong/wandb",
+            group=args.wandb_group,
+            name=args.wandb_run_name,
+            config=vars(args),
+            reinit=True,
+        )
+
     #logger.info("Partitioning data")
     X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
         args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
@@ -1254,83 +1106,63 @@ if __name__ == '__main__':
 
 
     elif args.alg == 'sisa':
+        # prepare the global full training dataset (already loaded earlier)
+        # train_ds_global is from: get_dataloader(...)[2]
+        # wrap each client's indices into a Subset
+
+        # single model (same network for all), single optimizer
         nets, _, _ = init_nets(args.net_config, args.dropout_p, 1, args)
         model = nets[0].to(device)
 
-        W_n_0 = [param.clone().detach().requires_grad_(True) for param in model.parameters()]
+        epoches = 10
+        W_n_0 = [param.clone().detach().requires_grad_(True) for param in model.parameters()]    
         W_b_initial = [[param.clone() for param in W_n_0] for _ in range(args.n_parties)]
         P_b_initial = [[torch.zeros_like(param) for param in W_n_0] for _ in range(args.n_parties)]
         accumulators_initial = [[torch.zeros_like(param) for param in W_n_0] for _ in range(args.n_parties)]
 
-        # fixed rho, adaptive sigma
+
         sigma_lr = args.sigma_lr
         rho_lr = args.rho_lr
         l2_lambda = args.l2_lambda
 
-        sigma_mode = getattr(args, "sigma_mode", "fixed")
-        sigma_min = getattr(args, "sigma_min", 1e-6)
-        sigma_max = getattr(args, "sigma_max", 1e6)
 
-        eta_u = getattr(args, "eta_u", 0.05)
-        G_clip = getattr(args, "G_clip", 10.0)
 
-        # log-sigma state for online updates
-        u_sigma = torch.tensor(math.log(max(sigma_lr, 1e-12)), device=device)
-
+        #alpha_b = [1/3, 1/3, 1/3]
         total_data_points = sum([len(net_dataidx_map[r]) for r in range(args.n_parties)])
-        alpha_b = [len(net_dataidx_map[r]) / total_data_points for r in range(args.n_parties)]
-
-        W_global = generate_W_global(
-            args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda
-        )
+        alpha_b = [len(net_dataidx_map[r])/total_data_points for r in range(args.n_parties)]
+        #alpha_b = [1/args.n_parties for _ in range(args.n_parties)]
+        W_global = generate_W_global(args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda)
         W_global_prev = [w.clone().detach() for w in W_global]
-
-        epsilon = getattr(args, "eps", 1e-8)
+        epsilon = 1e-8
         updated_iteration = 1.0
-        beta_rmsprop = 0.999
+        beta_rmsprop = 0.999 # 0.99 not sure which one is better
         criterion = nn.CrossEntropyLoss().to(device)
+        test_loader = data.DataLoader(dataset=test_ds_global, batch_size=128, shuffle=False)
         test_record = []
 
+
+
+        # Print ratio info for each aggregated global minibatch
         for epoch in range(args.comm_round):
-            epoch_train_correct = 0
-            epoch_train_total = 0
-            epoch_train_loss = 0.0
-
-            sigma_before_epoch = sigma_lr
-
-            # store per-client residuals for logging
-            primal_res_hist = [0.0 for _ in range(args.n_parties)]
-            dual_res_hist = [0.0 for _ in range(args.n_parties)]
-            delta_y_hist = [0.0 for _ in range(args.n_parties)]
-
-            # store residuals for global sigma update
-            epoch_primal_res = []
-            epoch_dual_res = []
-            epoch_delta_y = []
-
+            #print(f"\n>>> Epoch {epoch}/{args.epochs-1}")
             for sb in range(args.n_parties):
                 dataidxs = net_dataidx_map[sb]
+                #print("Training network %s. n_training: %d" % (str(sb), len(dataidxs)))
                 noise_level = args.noise
                 if sb == args.n_parties - 1:
                     noise_level = 0
 
                 if args.noise_type == 'space':
-                    train_dl_local, test_dl_local, _, _ = get_dataloader(
-                        args.dataset, args.datadir, args.batch_size, 32,
-                        dataidxs, noise_level, sb, args.n_parties - 1
-                    )
+                    train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level, sb, args.n_parties-1)
                 else:
                     noise_level = args.noise / (args.n_parties - 1) * sb
-                    train_dl_local, test_dl_local, _, _ = get_dataloader(
-                        args.dataset, args.datadir, args.batch_size, 32,
-                        dataidxs, noise_level
-                    )
-
+                    train_dl_local, test_dl_local, _, _ = get_dataloader(args.dataset, args.datadir, args.batch_size, 32, dataidxs, noise_level)
                 if type(train_dl_local) == type([1]):
-                    train_dataloader = train_dl_local
+                    pass
                 else:
                     train_dataloader = [train_dl_local]
 
+                gradient_accumulation_steps = len(train_dl_local)
                 with torch.no_grad():
                     for param, w in zip(model.parameters(), W_global):
                         param.copy_(w)
@@ -1338,172 +1170,108 @@ if __name__ == '__main__':
                 W_n = W_b_initial[sb]
                 P_n = P_b_initial[sb]
                 accumulators = accumulators_initial[sb]
-
-                # save previous local iterate for convex-bal variant
-                W_n_prev = [w.clone().detach() for w in W_n]
-
-                zero_grad(model.parameters())
-
                 for tmp in train_dataloader:
                     for batch_idx, (x, target) in enumerate(tmp):
+                        '''if batch_idx == 0:
+                            print('#############')
+                            unique_labels = torch.unique(target)
+                            print('The label is:', unique_labels)'''
                         x, target = x.to(device), target.to(device)
                         x.requires_grad = True
+                        target.requires_grad = False
                         target = target.long()
 
                         out = model(x)
                         loss = criterion(out, target)
 
-                        with torch.no_grad():
-                            pred = torch.argmax(out, dim=1)
-                            epoch_train_correct += (pred == target).sum().item()
-                            epoch_train_total += target.size(0)
-                            epoch_train_loss += loss.item() * target.size(0)
-
+                        #loss = loss / gradient_accumulation_steps # for svhn only
                         loss.backward()
 
                 gradients = [param.grad for param in model.parameters()]
-
                 with torch.no_grad():
-                    current_sigma = sigma_lr
-                    current_rho = rho_lr
 
-                    for i, (param_wn, param_pn, gradient, param_wg, accumulator) in enumerate(
-                        zip(W_n, P_n, gradients, W_global, accumulators)
-                    ):
-                        accumulator.mul_(beta_rmsprop).add_(
-                            (1 - beta_rmsprop) * (gradient + param_pn).pow(2)
-                        )
+                        for i, (param_wn, param_pn, gradient, param_wg, accumulator) in enumerate(zip(W_n, P_n, gradients, W_global, accumulators)):
+                            #velocity.mul_(args.beta1).add_((1 - args.beta1) * (gradient + param_pn))
+                            accumulator.mul_(beta_rmsprop).add_((1 - beta_rmsprop) * (gradient + param_pn).pow(2))
+                            #accumulator.mul_(beta_rmsprop).add_((1 - beta_rmsprop) * gradient.pow(2))
+                            #accumulator.mul_(beta_rmsprop).add_((1 - beta_rmsprop) *  param_pn.pow(2))
+                            
+                            
+                            bias_correction2 = 1 - beta_rmsprop** updated_iteration                        
+                            corrected_accumulator = accumulator / (bias_correction2)
+                            #bias_correction1 = 1 - args.beta1** updated_iteration                        
+                            #corrected_velocity= velocity / (bias_correction1)
+                            
+                            #delta = param_wg -  (gradient+ param_pn)/(sigma_lr_current + rho_lr_current*(torch.sqrt(corrected_accumulator) + args.eps))
+                            delta = param_wg -  (gradient+ param_pn)/(sigma_lr+ rho_lr * (torch.sqrt(corrected_accumulator) + epsilon))
+                            
+                            param_wn.copy_(delta.detach())
+                            param_pn.add_(sigma_lr * (param_wn - param_wg))
 
-                        bias_correction2 = 1 - beta_rmsprop ** updated_iteration
-                        corrected_accumulator = accumulator / bias_correction2
-
-                        delta = param_wg - (gradient + param_pn) / (
-                            current_sigma + current_rho * (torch.sqrt(corrected_accumulator) + epsilon)
-                        )
-
-                        param_wn.copy_(delta.detach())
-                        param_pn.add_(current_sigma * (param_wn - param_wg))
-
-                    primal_res = global_norm([a - b for a, b in zip(W_n, W_global)])
-                    dual_res = current_sigma * global_norm([a - b for a, b in zip(W_global, W_global_prev)])
-                    delta_y = global_norm([a - b for a, b in zip(W_n, W_n_prev)])
-
-                    primal_res_hist[sb] = primal_res.item()
-                    dual_res_hist[sb] = dual_res.item()
-                    delta_y_hist[sb] = delta_y.item()
-
-                    epoch_primal_res.append(primal_res.item())
-                    epoch_dual_res.append(dual_res.item())
-                    epoch_delta_y.append(delta_y.item())
-
-                # updated_iteration += 1
                 zero_grad(model.parameters())
                 del loss
                 del out
 
-            # aggregate global model using current sigma
             with torch.no_grad():
                 W_global_prev = [w.clone().detach() for w in W_global]
-                W_global = generate_W_global(
-                    args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda
-                )
+                #W_global = generate_W_global(num_gpu, W_b_initial, P_b_initial, sigma_lr, alpha_b_n[(update_count-num_gpu):update_count])
+                W_global = generate_W_global(args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda)
                 for param, w in zip(model.parameters(), W_global):
                     param.copy_(w)
 
-            # compute epoch-level averaged residuals
-            # avg_primal_res = sum(epoch_primal_res) / max(len(epoch_primal_res), 1)
-            # avg_dual_res = sum(epoch_dual_res) / max(len(epoch_dual_res), 1)
-            # avg_delta_y = sum(epoch_delta_y) / max(len(epoch_delta_y), 1)
-            avg_primal_res = sum(alpha_b[i] * epoch_primal_res[i] for i in range(args.n_parties))
-            avg_dual_res = sum(alpha_b[i] * epoch_dual_res[i] for i in range(args.n_parties))
-            avg_delta_y = sum(alpha_b[i] * epoch_delta_y[i] for i in range(args.n_parties))
+            # residual diagnostics
+            with torch.no_grad():
+                primal_sq = None
+                for sb in range(args.n_parties):
+                    client_sq = None
+                    for wi, wg in zip(W_b_initial[sb], W_global):
+                        diff = wi - wg
+                        val = torch.sum(diff * diff)
+                        client_sq = val if client_sq is None else client_sq + val
+                    weighted = alpha_b[sb] * client_sq
+                    primal_sq = weighted if primal_sq is None else primal_sq + weighted
+                avg_primal_res = torch.sqrt(primal_sq)
+                avg_dual_base = diff_global_norm(W_global, W_global_prev)
 
-            if epoch % 10 == 0 and 0 < epoch:
-            # if epoch % 1 == 0 and 0 < epoch:
-                # update global sigma once per epoch
-                if sigma_mode == "heuristic":
-                    sigma_new = heuristic_update_sigma(
-                        sigma_lr,
-                        avg_primal_res,
-                        avg_dual_res,
-                        mu=getattr(args, "sigma_mu", 10.0),
-                        tau=getattr(args, "sigma_tau", 2.0),
-                    )
-                    sigma_lr = float(max(sigma_min, min(sigma_max, sigma_new)))
+            if epoch % 10 == 0 and 0 < epoch: # epoch % 10  make it even smaller to avoid acc drop in the first 10 steps
+            #if epoch % args.decay_epoch == 0 and 0 < epoch < args.terminate_decay:
+                #sigma_lr /=0.5 #/=0.5
+                sigma_lr /= args.mu_lr
+                #print('The sigma_lr is:', sigma_lr)
 
-                elif sigma_mode == "online_balance":
-                    u = u_sigma.detach().requires_grad_(True)
-                    u_new, sigma_loss = online_ogd_update_u(
-                        u,
-                        torch.tensor(avg_primal_res, device=device),
-                        torch.tensor(avg_dual_res, device=device),
-                        eta_u=eta_u,
-                        G_clip=G_clip,
-                        u_min=math.log(sigma_min),
-                        u_max=math.log(sigma_max),
-                    )
-                    u_sigma = u_new
-                    sigma_lr = float(torch.exp(u_new).item())
 
-                elif sigma_mode == "online_convex_bal":
-                    u = u_sigma.detach()
-                    u_new, sigma_loss, sigma_target, grad_u = online_convex_bal_update_u(
-                        u=u,
-                        primal_res=torch.tensor(avg_primal_res, device=device),
-                        delta_y=torch.tensor(avg_delta_y, device=device),
-                        eta_u=eta_u/(epoch+1),  # decay learning rate over epochs
-                        G_clip=G_clip,
-                        u_min=math.log(sigma_min),
-                        u_max=math.log(sigma_max),
-                        eps=getattr(args, "eps", 1e-12),
-                    )
-                    u_sigma = u_new
-                    sigma_lr = float(torch.exp(u_new).item())
 
-                else:
-                    # original global sigma decay schedule for fixed mode
-                    # sigma_lr /= args.mu_lr
-                    pass
-
-            train_acc = epoch_train_correct / max(epoch_train_total, 1)
-            train_loss = epoch_train_loss / max(epoch_train_total, 1)
-
+            #test_acc = compute_accuracy(model, test_loader, get_confusion_matrix=False, device=device)
             test_acc = compute_accuracy(model, test_dl_global, get_confusion_matrix=False, device=device)
             test_record.append(test_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+            logger.info('>> primal_res/avg: %f' % avg_primal_res.item())
+            logger.info('>> delta_w_global: %f' % avg_dual_base.item())
+            logger.info('>> sigma_lr: %f' % sigma_lr)
 
-            if getattr(args, "use_wandb", False):
+            if args.use_wandb:
                 log_dict = {
-                    "train/acc": train_acc,
-                    "train/loss": train_loss,
+                    "round": epoch,
                     "test/acc": test_acc,
-                    "sigma": sigma_lr,
-                    "log_sigma": math.log(max(sigma_lr, 1e-12)),
-                    "sigma_change": sigma_lr - sigma_before_epoch,
-                    "primal_res/avg": avg_primal_res,
-                    "dual_res/avg": avg_dual_res,
-                    "delta_y/avg": avg_delta_y,
-                    "rho_fixed": rho_lr,
+                    "primal_res/avg": avg_primal_res.item(),
+                    "delta_w_global/avg": avg_dual_base.item(),
+                    "sigma/value": sigma_lr,
+                    "log_sigma/value": math.log(max(sigma_lr, 1e-12)),
                 }
-
-                for i in range(args.n_parties):
-                    log_dict[f"primal_res/client_{i}"] = primal_res_hist[i]
-                    log_dict[f"dual_res/client_{i}"] = dual_res_hist[i]
-                    log_dict[f"delta_y/client_{i}"] = delta_y_hist[i]
-
-                # if sigma_mode == "online_convex_bal":
-                #     log_dict["sigma_target"] = sigma_target.item()
-                #     log_dict["sigma_grad_u"] = grad_u.item()
-                #     log_dict["sigma_loss"] = sigma_loss.item()
-
-                # elif sigma_mode == "online_balance":
-                #     log_dict["sigma_loss"] = sigma_loss.item()
-
+                for sb in range(args.n_parties):
+                    client_sq = None
+                    for wi, wg in zip(W_b_initial[sb], W_global):
+                        diff = wi - wg
+                        val = torch.sum(diff * diff)
+                        client_sq = val if client_sq is None else client_sq + val
+                    log_dict[f"primal_res/client_{sb}"] = torch.sqrt(client_sq).item()
                 wandb.log(log_dict, step=epoch)
 
+        #print(test_record)
         print('######################################################')
         print('The highest test accuracy is:', max(test_record))
         print('######################################################')
+
 
 
     elif args.alg == 'fedavg':
