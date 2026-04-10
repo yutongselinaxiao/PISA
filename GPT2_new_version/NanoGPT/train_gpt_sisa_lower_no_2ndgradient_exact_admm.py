@@ -964,10 +964,13 @@ try:
 
         # --------------- ADAPTIVE SIGMA UPDATE -----------------
         if args.sigma_mode == "heuristic":
+            # He et al. S3 compares ||r|| vs mu*||s|| where s = sigma * ||Δw||
+            # dual_res is the unscaled ||w^{k+1} - w^k||, so scale by sigma
+            scaled_dual = sigma_lr_current * dual_res
             sigma_new = heuristic_update_sigma(
                 sigma_lr_current,
                 primal_res,
-                dual_res,
+                scaled_dual,
                 mu=args.sigma_mu_thresh,
                 tau=args.sigma_tau,
                 k=step,

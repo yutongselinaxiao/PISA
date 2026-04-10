@@ -1425,10 +1425,13 @@ if __name__ == '__main__':
             # -----------------------------------------
             if ((round_idx + 1) % sigma_update_freq == 0):
                 if sigma_mode == "heuristic":
+                    # He et al. S3 compares ||r|| vs mu*||s|| where s = sigma * ||Δw||
+                    # dual_smooth is the unscaled ||w^{k+1} - w^k||, so scale by sigma_lr
+                    scaled_dual = sigma_lr * float(dual_smooth.item())
                     sigma_new = heuristic_update_sigma(
                         sigma_lr,
                         float(primal_smooth.item()),
-                        float(dual_smooth.item()),
+                        scaled_dual,
                         mu=args.sigma_mu,
                         tau=args.sigma_tau,
                         k=round_idx,
@@ -1441,7 +1444,8 @@ if __name__ == '__main__':
                     # Diminishing step size: eta_k = eta_u / sqrt(k+1)
                     # Required for O(sqrt(K)) regret in online convex optimization
                     # Satisfies: sum eta_k = inf (exploration), sum eta_k^2 < inf (convergence)
-                    eta_k = eta_u / math.sqrt(round_idx + 1.0)
+                    # eta_k = eta_u / math.sqrt(round_idx + 1.0)
+                    eta_k = eta_u
                     u_new, sigma_loss, sigma_target, sigma_grad = online_convex_bal_update_u(
                         u_sigma,
                         primal_smooth,

@@ -6,7 +6,7 @@ OUTPUT_DIR = Path("generated_sisa_exact_admm_runs")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # physical GPU id
-CUDA_DEVICE = "5"
+CUDA_DEVICE = "2"
 
 SIGMA_LR = "1e2"
 SEEDS = [0, 1, 2]
@@ -52,7 +52,7 @@ ADAPTIVE_EXTRA_ARGS = {
     "G_clip": "5.0",
     "eps": "1e-12",
     "sigma_update_freq": "1",
-    # "sigma_ema_beta": "0.9",
+    "sigma_ema_beta": "0.9",
 }
 
 HEURISTIC_EXTRA_ARGS = {
@@ -89,11 +89,11 @@ METHODS = [
     #     "entry": ORIGINAL_ENTRY,
     #     "extra_args": FIXED_EXTRA_ARGS,
     # },
-    {
-        "method_name": "adaptive",
-        "entry": EXACT_ADMM_ENTRY,
-        "extra_args": ADAPTIVE_EXTRA_ARGS,
-    },
+    # {
+    #     "method_name": "adaptive",
+    #     "entry": EXACT_ADMM_ENTRY,
+    #     "extra_args": ADAPTIVE_EXTRA_ARGS,
+    # },
     {
         "method_name": "heuristic",
         "entry": EXACT_ADMM_ENTRY,
@@ -131,7 +131,7 @@ def build_wandb_names(case: dict, method_name: str):
     elif method_name == "adaptive":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_convbal_sharedsigma_{EXPERIMENT_TAG}_seed${{seed}}_diminishing_eta_no_ema"
     elif method_name == "heuristic":
-        run_name = f"{case['dataset']}_sig${{sigma_lr}}_heuristic_{EXPERIMENT_TAG}_seed${{seed}}"
+        run_name = f"{case['dataset']}_sig${{sigma_lr}}_heuristic_{EXPERIMENT_TAG}_seed${{seed}}_updated"
     elif method_name == "original":
         run_name = f"{case['dataset']}_original_{EXPERIMENT_TAG}_seed${{seed}}"
     else:

@@ -1325,7 +1325,6 @@ if __name__ == '__main__':
                         args.dataset, args.datadir, args.batch_size, 32,
                         dataidxs, noise_level
                     )
-
                 if type(train_dl_local) == type([1]):
                     train_dataloader = train_dl_local
                 else:
