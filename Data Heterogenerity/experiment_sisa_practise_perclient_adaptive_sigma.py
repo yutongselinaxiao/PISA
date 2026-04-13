@@ -179,8 +179,8 @@ def online_convex_bal_update_u(
     r_clip = torch.clamp(primal_res, min=eps)
     dy_clip = torch.clamp(delta_y, min=eps)
 
-    # target = torch.log(r_clip) - torch.log(dy_clip)
-    target = -torch.log(r_clip) + torch.log(dy_clip)
+    target = torch.log(r_clip) - torch.log(dy_clip)
+    # target = -torch.log(r_clip) + torch.log(dy_clip)
     grad_u = u - target                  # exact gradient of 0.5 * (u - target)^2
     grad_u = torch.clamp(grad_u, -G_clip, G_clip)
 
