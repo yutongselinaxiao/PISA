@@ -175,11 +175,8 @@ def make_executable(path: Path):
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def make_experiment_tag(sigma_lr_val: str, task_lambda_val: str = None) -> str:
-    tag = f"exact_admm_shared_sigma_pilot_initsig_{sigma_lr_val}_4_7"
-    # if task_lambda_val is not None:
-    #     tag += f"_lam_{task_lambda_val}"
-    return tag
+def make_experiment_tag(sigma_lr_val: str) -> str:
+    return f"exact_admm_shared_sigma_pilot_initsig_{sigma_lr_val}_4_7"
 
 
 def build_wandb_names(case: dict, method_name: str, tag: str = None):
@@ -263,8 +260,8 @@ def main():
                 for slr in SIGMA_LR_VALUES:
                     if sweep_tl:
                         for tl in TASK_LAMBDA_VALUES:
-                            tag = make_experiment_tag(slr, tl)
-                            script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
+                            tag = make_experiment_tag(slr)  # group name matches other methods
+                            script_name = f"{case['case_name']}_{method['method_name']}_{tag}_lam_{tl}.sh"
                             script_path = OUTPUT_DIR / script_name
                             script_text = build_script_text(case, method, sigma_lr=slr, task_lambda=tl, tag=tag)
                             script_path.write_text(script_text, encoding="utf-8")
