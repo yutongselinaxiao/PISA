@@ -6,7 +6,7 @@ OUTPUT_DIR = Path("generated_sisa_task_aware_runs")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # physical GPU id
-CUDA_DEVICE = "1"
+CUDA_DEVICE = "0"
 
 SEEDS = [0, 1, 2]
 
@@ -28,7 +28,7 @@ COMMON_ARGS = {
     "comm_round": "500",
     "beta": "0.5",
     "device": "cuda:0",
-    "datadir": "/data/yutong/datasets",
+    "datadir": "/dataMeR2/yutong/datasets",
     "logdir": "./logs/",
     "noise": "0",
     "sample": "1",
