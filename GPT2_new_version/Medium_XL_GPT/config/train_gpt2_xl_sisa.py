@@ -35,5 +35,7 @@ min_lr = 1e-5
 
 
 comment = 'gpt2_xl_sisa'
-save_dir = 'log_gpt2/'+comment
-out_dir = 'out_gpt2/' +comment # save ckpt
+# save_dir = 'log_gpt2/'+comment
+# out_dir = 'out_gpt2/' +comment # save ckpt
+save_dir = '/dataMeR2/yutong/sisa_gpt2/log_gpt2/'+comment
+out_dir = '/dataMeR2/yutong/sisa_gpt2/out_gpt2/' +comment # save ckpt

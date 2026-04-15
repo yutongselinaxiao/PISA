@@ -86,8 +86,10 @@ muon_learning_rate : float = 0.002
 warmup_iters : int = 0
 warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
 weight_decay : float = 0
-input_bin : str = 'data/fineweb10B/fineweb_train_*.bin'
-input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin'
+# input_bin : str = 'data/fineweb10B/fineweb_train_*.bin'
+# input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin'
+input_bin : str = '/dataMeR2/yutong/fineweb10B/fineweb_train_*.bin'
+input_val_bin : str = '/dataMeR2/yutong/fineweb10B/fineweb_val_*.bin'
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
@@ -850,9 +852,9 @@ def train():
     #while True:
     train_loader.reset()
     val_loss_record = []
-    save_path_val = "/workspace0/ow120/DDAM/Adam-mini/examples/gpt2/experiment_results/sisa_submit/val_loss_record_no2g_adagrad.txt"
+    save_path_val = "/dataMeR2/yutong/sisa_gpt2/experiment_results/sisa_sumbit/val_loss_record_no2g_adagrad.txt"
     train_time_record = []
-    save_path_time = "/workspace0/ow120/DDAM/Adam-mini/examples/gpt2/experiment_results/sisa_submit/train_time_record_no2g_adagrad.txt"
+    save_path_time = "/dataMeR2/yutong/sisa_gpt2/experiment_results/sisa_sumbit/train_time_record_no2g_adagrad.txt"
     for step in range(num_iterations + 1):
         # determine and set the learning rate for this iteration
         last_step = (step == num_iterations)
