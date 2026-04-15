@@ -177,8 +177,8 @@ def make_executable(path: Path):
 
 def make_experiment_tag(sigma_lr_val: str, task_lambda_val: str = None) -> str:
     tag = f"exact_admm_shared_sigma_pilot_initsig_{sigma_lr_val}_4_7"
-    if task_lambda_val is not None:
-        tag += f"_lam_{task_lambda_val}"
+    # if task_lambda_val is not None:
+    #     tag += f"_lam_{task_lambda_val}"
     return tag
 
 
