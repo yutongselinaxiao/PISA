@@ -42,6 +42,7 @@ import uuid
 import glob
 import time
 from collections import defaultdict
+import wandb
 
 
 # ipdb.set_trace()
@@ -101,6 +102,10 @@ comment = 'none'
 algorithm = 'muon'
 #algorithm = 'adamw'
 flash_attn = True
+# wandb
+use_wandb = True
+wandb_project = 'gpt2-sisa-online'
+wandb_run_name = None
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -331,6 +336,8 @@ class DistributedOptimizer(torch.optim.Optimizer):
         self.max_steps = 5100
         self.epsilon_vv = 1e-15
         self.local_batch_size = None  # Will be set during training
+        self.last_primal_res = None
+        self.last_dual_res = None
 
         # Maintain original parameter shapes
         self.params = self.param_groups[0]['params']
@@ -397,6 +404,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 updates_flat_w = updates_flat_w.to(torch.bfloat16)
             else:
                 updates_flat_w = updates_flat_w
+            local_w_list = []
             curr_idx = 0
 
 
@@ -489,6 +497,8 @@ class DistributedOptimizer(torch.optim.Optimizer):
         #dist.all_reduce(self.updates_flat_p, op=dist.ReduceOp.SUM)
         
         curr_idx = 0
+        primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        dual_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
 
 
         # Use all_reduce for direct weighted summation
@@ -501,12 +511,21 @@ class DistributedOptimizer(torch.optim.Optimizer):
             sigma_lr_i = sigma_lr
             #new_W = (sigma_lr_i*w_scaled + p_scaled) / (sigma_lr_i+self.args.l2_lambda)
             new_W = wpi / (sigma_lr_i+self.args.l2_lambda)
+            # NEW: primal residual proxy = local/global disagreement
+            primal_sq += ((local_w_list[i].to(torch.float32) - new_W.to(torch.float32)) ** 2).sum()
+
+            # NEW: dual residual proxy = global movement
+            dual_sq += ((new_W.to(torch.float32) - prev_W_global[i].to(torch.float32)) ** 2).sum()
 
 
             para.data.copy_(new_W)
 
             curr_idx += para.numel()
         
+        # NEW: save residuals for scheduler
+        self.last_primal_res = torch.sqrt(primal_sq + 1e-16).item()
+        # scale dual by sigma to mimic ADMM-style dual motion
+        self.last_dual_res = (float(sigma_lr) * torch.sqrt(dual_sq + 1e-16)).item()
 
         self._step += 1
 
@@ -835,7 +854,14 @@ def get_lr(it):
         return decay_ratio
 schedulers_adam  = torch.optim.lr_scheduler.LambdaLR(optimizer1, get_lr)
 sched_sigma_rho = ADMMParamScheduler(optimizer2_2, optimizer1, args, embed_learning_rate)
-# logging
+# wandb init
+if use_wandb and master_process:
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name or comment,
+        config=config,
+        dir=save_dir,
+    )
 
 def train():
     global iter_num, x, y
@@ -897,6 +923,11 @@ def train():
                 print(f'step:{step}/{num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
                 val_loss_record.append(val_loss)
                 train_time_record.append(training_time_ms)
+                if use_wandb:
+                    wandb.log({
+                        "val/loss": val_loss.item(),
+                        "val/training_time_ms": training_time_ms,
+                    }, step=step)
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.time()
@@ -953,6 +984,20 @@ def train():
         if master_process:
             approx_time = training_time_ms + 1000 * (time.time() - t0)
             print(f"step:{step+1}/{num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            if use_wandb:
+                log_dict = {
+                    "train/loss": train_loss.item(),
+                    "admm/sigma_lr": optimizer2_2.param_groups[0]['sigma_lr'],
+                    "admm/rho_lr": optimizer2_2.param_groups[0]['rho_lr'],
+                    "lr/adam": optimizer1.param_groups[0]['lr'],
+                }
+                if optimizer2_2.last_primal_res is not None:
+                    log_dict["admm/primal_residual"] = optimizer2_2.last_primal_res
+                    log_dict["admm/dual_residual"] = optimizer2_2.last_dual_res
+                    log_dict["admm/primal_dual_ratio"] = (
+                        optimizer2_2.last_primal_res / max(optimizer2_2.last_dual_res, 1e-16)
+                    )
+                wandb.log(log_dict, step=step)
 
         iter_num += 1
         local_iter_num += 1
@@ -964,6 +1009,8 @@ def train():
     if master_process:
         np.savetxt(save_path_val, np.array([t.cpu().item() for t in val_loss_record]), fmt='%.6f')
         np.savetxt(save_path_time, np.array(train_time_record), fmt='%.6f')
+        if use_wandb:
+            wandb.finish()
     if ddp:
         destroy_process_group()
 
