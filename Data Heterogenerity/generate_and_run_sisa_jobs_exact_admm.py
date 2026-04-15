@@ -73,6 +73,21 @@ ORIGINAL_EXTRA_ARGS = {
     "comm_round": "500",
 }
 
+TASK_AWARE_EXTRA_ARGS = {
+    "sigma_mode": "online_task_aware",
+    "sigma_min": "1e-6",
+    "sigma_max": "1e4",
+    "eta_u": "0.05",
+    "G_clip": "5.0",
+    "eps": "1e-12",
+    "sigma_update_freq": "1",
+    "sigma_ema_beta": "0.9",
+    "epochs": "3",
+    "task_lambda": "${task_lambda}",
+}
+
+TASK_LAMBDA_VALUES = ["0.1", "1.0", "10.0"]
+
 PERCLIENT_CONVBAL_ARGS = {
     "sigma_mode": "online_convex_bal",
     "sigma_update_freq": "1",
@@ -111,11 +126,18 @@ METHODS = [
     #     "entry": ORIGINAL_ENTRY,
     #     "extra_args": FIXED_EXTRA_ARGS,
     # },
+    # {
+    #     "method_name": "adaptive",
+    #     "entry": EXACT_ADMM_ENTRY,
+    #     "extra_args": ADAPTIVE_EXTRA_ARGS,
+    #     "sweep_sigma": True,
+    # },
     {
-        "method_name": "adaptive",
+        "method_name": "task_aware",
         "entry": EXACT_ADMM_ENTRY,
-        "extra_args": ADAPTIVE_EXTRA_ARGS,
+        "extra_args": TASK_AWARE_EXTRA_ARGS,
         "sweep_sigma": True,
+        "sweep_task_lambda": True,
     },
     # {
     #     "method_name": "heuristic",
@@ -153,8 +175,11 @@ def make_executable(path: Path):
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def make_experiment_tag(sigma_lr_val: str) -> str:
-    return f"exact_admm_shared_sigma_pilot_initsig_{sigma_lr_val}_4_7"
+def make_experiment_tag(sigma_lr_val: str, task_lambda_val: str = None) -> str:
+    tag = f"exact_admm_shared_sigma_pilot_initsig_{sigma_lr_val}_4_7"
+    if task_lambda_val is not None:
+        tag += f"_lam_{task_lambda_val}"
+    return tag
 
 
 def build_wandb_names(case: dict, method_name: str, tag: str = None):
@@ -168,6 +193,8 @@ def build_wandb_names(case: dict, method_name: str, tag: str = None):
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_heuristic_{t}_seed${{seed}}_updated"
     elif method_name == "original":
         run_name = f"{case['dataset']}_original_{t}_seed${{seed}}"
+    elif method_name == "task_aware":
+        run_name = f"{case['dataset']}_sig${{sigma_lr}}_task_aware_lam${{task_lambda}}_{t}_seed${{seed}}"
     elif method_name == "perclient_convbal":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_perclient_convbal_stabilized_{t}_seed${{seed}}"
     else:
@@ -198,22 +225,28 @@ def build_command_template(case: dict, method: dict, tag: str = None) -> str:
     return "\n".join(lines)
 
 
-def build_script_text(case: dict, method: dict, sigma_lr: str = None, tag: str = None) -> str:
+def build_script_text(case: dict, method: dict, sigma_lr: str = None,
+                      task_lambda: str = None, tag: str = None) -> str:
     cmd = build_command_template(case, method, tag=tag)
     slr = sigma_lr if sigma_lr is not None else SIGMA_LR
-    return "\n".join([
+    header_lines = [
         "#!/bin/bash",
         "",
         "set -e",
         "",
         f"sigma_lr={slr}",
+    ]
+    if task_lambda is not None:
+        header_lines.append(f"task_lambda={task_lambda}")
+    header_lines += [
         "",
         "for seed in 0 1 2",
         "do",
         cmd,
         "done",
         "",
-    ])
+    ]
+    return "\n".join(header_lines)
 
 
 def main():
@@ -224,17 +257,29 @@ def main():
 
     for case in CASES:
         for method in METHODS:
+            sweep_tl = method.get("sweep_task_lambda", False)
+
             if method.get("sweep_sigma", False):
-                # Per-client: generate one script per sigma_init value
                 for slr in SIGMA_LR_VALUES:
-                    tag = make_experiment_tag(slr)
-                    script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
-                    script_path = OUTPUT_DIR / script_name
-                    script_text = build_script_text(case, method, sigma_lr=slr, tag=tag)
-                    script_path.write_text(script_text, encoding="utf-8")
-                    make_executable(script_path)
-                    generated_scripts.append(script_path)
-                    print(f"Generated: {script_path}")
+                    if sweep_tl:
+                        for tl in TASK_LAMBDA_VALUES:
+                            tag = make_experiment_tag(slr, tl)
+                            script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
+                            script_path = OUTPUT_DIR / script_name
+                            script_text = build_script_text(case, method, sigma_lr=slr, task_lambda=tl, tag=tag)
+                            script_path.write_text(script_text, encoding="utf-8")
+                            make_executable(script_path)
+                            generated_scripts.append(script_path)
+                            print(f"Generated: {script_path}")
+                    else:
+                        tag = make_experiment_tag(slr)
+                        script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
+                        script_path = OUTPUT_DIR / script_name
+                        script_text = build_script_text(case, method, sigma_lr=slr, tag=tag)
+                        script_path.write_text(script_text, encoding="utf-8")
+                        make_executable(script_path)
+                        generated_scripts.append(script_path)
+                        print(f"Generated: {script_path}")
             else:
                 script_name = f"{case['case_name']}_{method['method_name']}_{EXPERIMENT_TAG}.sh"
                 script_path = OUTPUT_DIR / script_name

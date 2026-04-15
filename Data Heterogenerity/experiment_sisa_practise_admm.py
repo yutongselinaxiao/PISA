@@ -167,7 +167,7 @@ def get_args():
     parser.add_argument('--terminate_decay', type=float, default=50, help='hyperparameter stop sigma decay in sisa')
     
     parser.add_argument('--sigma_mode', type=str, default='fixed',
-                        help='fixed / online_convex_bal / heuristic')
+                        help='fixed / online_convex_bal / heuristic / online_task_aware')
     parser.add_argument('--sigma_min', type=float, default=1e-6,
                         help='minimum sigma')
     parser.add_argument('--sigma_max', type=float, default=1e4,
@@ -188,6 +188,8 @@ def get_args():
                         help='stop heuristic adjustment after this many rounds (sum tau_k < inf)')
     parser.add_argument('--eps', type=float, default=1e-12,
                         help='numerical epsilon')
+    parser.add_argument('--task_lambda', type=float, default=1.0,
+                        help='weight of task-awareness term in online_task_aware sigma mode')
     parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
     parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
@@ -1073,6 +1075,62 @@ def online_convex_bal_update_u(
 
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
 
+
+def online_task_aware_update_u(
+    u,
+    primal_res,
+    dual_base,
+    train_loss_curr,
+    train_loss_prev,
+    task_lambda=1.0,
+    eta_u=0.1,
+    u_min=math.log(1e-6),
+    u_max=math.log(1e4),
+    eps=1e-12,
+    G_clip=10.0,
+):
+    """
+    Task-aware online update for u = log(sigma).
+
+    L(u) = (u - target)^2 + task_lambda * relu(loss_curr - loss_prev) * |u - target|
+
+    When training loss is decreasing, the task term vanishes and the update
+    reduces to pure residual balance.
+    """
+    primal_clip = torch.clamp(primal_res.detach(), min=eps)
+    dual_clip = torch.clamp(dual_base.detach(), min=eps)
+
+    target = torch.log(primal_clip) - torch.log(dual_clip)
+    diff = u - target
+
+    # Residual balance gradient
+    grad_residual = 2.0 * diff
+
+    # Task-awareness gradient: activated only when loss increases
+    loss_increase = max(0.0, train_loss_curr - train_loss_prev)
+    grad_task = loss_increase * torch.sign(diff)
+
+    # Combined
+    grad_u = grad_residual + task_lambda * grad_task
+    grad_u = torch.clamp(grad_u, -G_clip, G_clip)
+
+    with torch.no_grad():
+        u_new = u - eta_u * grad_u
+        u_new = torch.clamp(u_new, min=u_min, max=u_max)
+        residual_loss = diff.pow(2)
+        task_loss = loss_increase * torch.abs(diff)
+        total_loss = residual_loss + task_lambda * task_loss
+
+    return (
+        u_new.detach(),
+        total_loss.detach(),
+        residual_loss.detach(),
+        task_loss.detach(),
+        target.detach(),
+        grad_u.detach(),
+    )
+
+
 if __name__ == '__main__':
     # torch.set_printoptions(profile="full")
     args = get_args()
@@ -1305,6 +1363,8 @@ if __name__ == '__main__':
         sigma_update_freq = getattr(args, "sigma_update_freq", 1)
         sigma_ema_beta = getattr(args, "sigma_ema_beta", 0.9)
         eps_val = getattr(args, "eps", 1e-12)
+        task_lambda = getattr(args, "task_lambda", 1.0)
+        prev_train_loss = None
 
         # u = log sigma for online update
         u_sigma = torch.tensor(
@@ -1440,6 +1500,9 @@ if __name__ == '__main__':
             sigma_loss = None
             sigma_target = None
             sigma_grad = None
+            sigma_res_loss = None
+            sigma_task_loss = None
+            ta_loss_increase = None
 
             # -----------------------------------------
             # 5) Adaptive sigma update for NEXT round
@@ -1479,6 +1542,30 @@ if __name__ == '__main__':
                     )
                     u_sigma = u_new
                     sigma_lr = float(torch.exp(u_new).item())
+
+                elif sigma_mode == "online_task_aware":
+                    cur_train_loss = sum(local_losses) / max(len(local_losses), 1)
+                    prev_loss = prev_train_loss if prev_train_loss is not None else cur_train_loss
+
+                    eta_k = eta_u
+                    (u_new, sigma_loss, sigma_res_loss, sigma_task_loss,
+                     sigma_target, sigma_grad) = online_task_aware_update_u(
+                        u_sigma,
+                        primal_smooth,
+                        dual_smooth,
+                        train_loss_curr=cur_train_loss,
+                        train_loss_prev=prev_loss,
+                        task_lambda=task_lambda,
+                        eta_u=eta_k,
+                        u_min=math.log(sigma_min),
+                        u_max=math.log(sigma_max),
+                        eps=eps_val,
+                        G_clip=G_clip,
+                    )
+                    u_sigma = u_new
+                    sigma_lr = float(torch.exp(u_new).item())
+                    ta_loss_increase = max(0.0, cur_train_loss - prev_loss)
+                    prev_train_loss = cur_train_loss
 
                 elif sigma_mode == "fixed":
                     sigma_lr /= args.mu_lr
@@ -1522,6 +1609,10 @@ if __name__ == '__main__':
                     log_dict["sigma/target"] = sigma_target.item()
                 if sigma_grad is not None:
                     log_dict["sigma/grad"] = sigma_grad.item()
+                if sigma_res_loss is not None:
+                    log_dict["sigma/residual_loss"] = sigma_res_loss.item()
+                    log_dict["sigma/task_loss"] = sigma_task_loss.item()
+                    log_dict["sigma/loss_increase"] = ta_loss_increase
 
                 for sb in range(args.n_parties):
                     client_sq = None
