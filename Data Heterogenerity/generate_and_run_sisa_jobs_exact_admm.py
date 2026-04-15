@@ -5,8 +5,8 @@ from pathlib import Path
 OUTPUT_DIR = Path("generated_sisa_exact_admm_runs")
 LOG_DIR = OUTPUT_DIR / "logs"
 
-# physical GPU id
-CUDA_DEVICE = "1"
+# physical GPU ids to distribute work across
+CUDA_DEVICES = ["4", "5", "6", "7"]
 
 # SIGMA_LR = "1e2"
 SEEDS = [0, 1, 2]
@@ -86,6 +86,19 @@ TASK_AWARE_EXTRA_ARGS = {
     "task_lambda": "${task_lambda}",
 }
 
+ADAPTIVE_ADAM_EXTRA_ARGS = {
+    "sigma_mode": "online_convex_bal",
+    "sigma_min": "1e-6",
+    "sigma_max": "1e4",
+    "eta_u": "0.05",
+    "G_clip": "5.0",
+    "eps": "1e-12",
+    "sigma_update_freq": "1",
+    "sigma_ema_beta": "0.9",
+    "epochs": "3",
+    "optimizer": "adam_warmstart",
+}
+
 TASK_LAMBDA_VALUES = ["0.1", "1.0", "10.0"]
 
 PERCLIENT_CONVBAL_ARGS = {
@@ -138,6 +151,12 @@ METHODS = [
         "extra_args": TASK_AWARE_EXTRA_ARGS,
         "sweep_sigma": True,
         "sweep_task_lambda": True,
+    },
+    {
+        "method_name": "adaptive_adam",
+        "entry": EXACT_ADMM_ENTRY,
+        "extra_args": ADAPTIVE_ADAM_EXTRA_ARGS,
+        "sweep_sigma": True,
     },
     # {
     #     "method_name": "heuristic",
@@ -192,6 +211,8 @@ def build_wandb_names(case: dict, method_name: str, tag: str = None):
         run_name = f"{case['dataset']}_original_{t}_seed${{seed}}"
     elif method_name == "task_aware":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_task_aware_lam${{task_lambda}}_{t}_seed${{seed}}"
+    elif method_name == "adaptive_adam":
+        run_name = f"{case['dataset']}_sig${{sigma_lr}}_convbal_adam_warmstart_{t}_seed${{seed}}"
     elif method_name == "perclient_convbal":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_perclient_convbal_stabilized_{t}_seed${{seed}}"
     else:
@@ -199,7 +220,7 @@ def build_wandb_names(case: dict, method_name: str, tag: str = None):
     return group, run_name
 
 
-def build_command_template(case: dict, method: dict, tag: str = None) -> str:
+def build_command_template(case: dict, method: dict, tag: str = None, cuda_device: str = "0") -> str:
     args = {}
     args.update(COMMON_ARGS)
     args.update({
@@ -214,7 +235,7 @@ def build_command_template(case: dict, method: dict, tag: str = None) -> str:
     args["wandb_group"] = wandb_group
     args["wandb_run_name"] = wandb_run_name
 
-    lines = [f"CUDA_VISIBLE_DEVICES={CUDA_DEVICE} python {method['entry']} \\"]
+    lines = [f"CUDA_VISIBLE_DEVICES={cuda_device} python {method['entry']} \\"]
     items = list(args.items())
     for i, (k, v) in enumerate(items):
         suffix = " \\" if i < len(items) - 1 else ""
@@ -223,8 +244,8 @@ def build_command_template(case: dict, method: dict, tag: str = None) -> str:
 
 
 def build_script_text(case: dict, method: dict, sigma_lr: str = None,
-                      task_lambda: str = None, tag: str = None) -> str:
-    cmd = build_command_template(case, method, tag=tag)
+                      task_lambda: str = None, tag: str = None, cuda_device: str = "0") -> str:
+    cmd = build_command_template(case, method, tag=tag, cuda_device=cuda_device)
     slr = sigma_lr if sigma_lr is not None else SIGMA_LR
     header_lines = [
         "#!/bin/bash",
@@ -250,7 +271,8 @@ def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-    generated_scripts = []
+    # Collect all job specs first, then assign GPUs round-robin
+    jobs = []
 
     for case in CASES:
         for method in METHODS:
@@ -260,37 +282,39 @@ def main():
                 for slr in SIGMA_LR_VALUES:
                     if sweep_tl:
                         for tl in TASK_LAMBDA_VALUES:
-                            tag = make_experiment_tag(slr)  # group name matches other methods
+                            tag = make_experiment_tag(slr)
                             script_name = f"{case['case_name']}_{method['method_name']}_{tag}_lam_{tl}.sh"
-                            script_path = OUTPUT_DIR / script_name
-                            script_text = build_script_text(case, method, sigma_lr=slr, task_lambda=tl, tag=tag)
-                            script_path.write_text(script_text, encoding="utf-8")
-                            make_executable(script_path)
-                            generated_scripts.append(script_path)
-                            print(f"Generated: {script_path}")
+                            jobs.append((case, method, slr, tl, tag, script_name))
                     else:
                         tag = make_experiment_tag(slr)
                         script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
-                        script_path = OUTPUT_DIR / script_name
-                        script_text = build_script_text(case, method, sigma_lr=slr, tag=tag)
-                        script_path.write_text(script_text, encoding="utf-8")
-                        make_executable(script_path)
-                        generated_scripts.append(script_path)
-                        print(f"Generated: {script_path}")
+                        jobs.append((case, method, slr, None, tag, script_name))
             else:
-                script_name = f"{case['case_name']}_{method['method_name']}_{EXPERIMENT_TAG}.sh"
-                script_path = OUTPUT_DIR / script_name
-                script_text = build_script_text(case, method)
-                script_path.write_text(script_text, encoding="utf-8")
-                make_executable(script_path)
-                generated_scripts.append(script_path)
-                print(f"Generated: {script_path}")
+                tag = make_experiment_tag("default")
+                script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
+                jobs.append((case, method, None, None, tag, script_name))
+
+    # Round-robin GPU assignment
+    generated_scripts = []
+    for idx, (case, method, slr, tl, tag, script_name) in enumerate(jobs):
+        gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
+        script_path = OUTPUT_DIR / script_name
+        script_text = build_script_text(
+            case, method, sigma_lr=slr, task_lambda=tl, tag=tag, cuda_device=gpu
+        )
+        script_path.write_text(script_text, encoding="utf-8")
+        make_executable(script_path)
+        generated_scripts.append(script_path)
+        print(f"Generated: {script_path}  [GPU {gpu}]")
+
+    total = len(generated_scripts)
+    print(f"\nGenerated {total} scripts across {len(CUDA_DEVICES)} GPUs.")
 
     if not RUN_AFTER_GENERATION:
-        print("\nGeneration complete. Not executing scripts.")
+        print("Not executing scripts.")
         return
 
-    print(f"\nLaunching all scripts in parallel on physical GPU {CUDA_DEVICE}...\n")
+    print(f"\nLaunching all scripts in parallel across GPUs {CUDA_DEVICES}...\n")
 
     processes = []
     for script_path in generated_scripts:

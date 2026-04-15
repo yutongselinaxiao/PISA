@@ -954,17 +954,31 @@ def diff_global_norm(list_a, list_b):
     return torch.sqrt(total)
 
 
-def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, device="cpu", alpha_i=1.0):
+def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, device="cpu", alpha_i=1.0,
+                     optimizer_state=None):
     """
     Approximately solve:
 
         min_wi alpha_i * F_i(wi) + <pi_i, wi - w_global> + (sigma/2)||wi - w_global||^2
+
+    When args.optimizer == 'adam_warmstart', uses Adam with warm-started optimizer
+    state across ADMM rounds. This gives per-parameter adaptive preconditioning
+    (like SISA's rho * sqrt(v)) while keeping sigma as a regularization weight,
+    preserving robustness to sigma initialization.
+
+    Returns:
+        (params, avg_loss) for sgd/adam/amsgrad
+        (params, avg_loss, optimizer_state_dict) for adam_warmstart
     """
     with torch.no_grad():
         for p, wg in zip(model.parameters(), w_global):
             p.copy_(wg)
 
-    if args.optimizer == 'adam':
+    if args.optimizer == 'adam_warmstart':
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+    elif args.optimizer == 'adam':
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg)
     elif args.optimizer == 'amsgrad':
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg, amsgrad=True)
@@ -1007,7 +1021,11 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
-    return [p.detach().clone() for p in model.parameters()], avg_loss
+    params = [p.detach().clone() for p in model.parameters()]
+
+    if args.optimizer == 'adam_warmstart':
+        return params, avg_loss, optimizer.state_dict()
+    return params, avg_loss
 
 
 def heuristic_update_sigma(sigma_old, primal_res, dual_res, mu=10.0, tau=2.0,
@@ -1353,6 +1371,9 @@ if __name__ == '__main__':
         # Unscaled dual variables pi_i
         P_b_initial = [[torch.zeros_like(param) for param in W_n_0] for _ in range(args.n_parties)]
 
+        # Per-client optimizer states for adam_warmstart
+        optimizer_states = [None for _ in range(args.n_parties)]
+
         sigma_lr = args.sigma_lr
         l2_lambda = args.l2_lambda
         sigma_mode = getattr(args, "sigma_mode", "fixed")
@@ -1425,7 +1446,7 @@ if __name__ == '__main__':
                         dataidxs, noise_level
                     )
 
-                W_i_new, avg_local_loss = local_admm_train(
+                result = local_admm_train(
                     model=model,
                     train_dl_local=train_dl_local,
                     w_global=W_global,
@@ -1433,8 +1454,14 @@ if __name__ == '__main__':
                     sigma_lr=sigma_lr,
                     args=args,
                     device=device,
-                    alpha_i=alpha_b[sb]
+                    alpha_i=alpha_b[sb],
+                    optimizer_state=optimizer_states[sb]
                 )
+
+                if args.optimizer == 'adam_warmstart':
+                    W_i_new, avg_local_loss, optimizer_states[sb] = result
+                else:
+                    W_i_new, avg_local_loss = result
 
                 new_W_b.append(W_i_new)
                 local_losses.append(avg_local_loss)
