@@ -1159,7 +1159,7 @@ if __name__ == '__main__':
 
         wandb.init(
             project=args.wandb_project,
-            # dir="/data/yutong/wandb",
+            dir="/dataMeR2/yutong/wandb",
             entity=args.wandb_entity,
             name=args.wandb_run_name,
             group=args.wandb_group,

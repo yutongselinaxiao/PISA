@@ -33,7 +33,7 @@ COMMON_ARGS = {
     "comm_round": "500",
     "beta": "0.5",
     "device": "cuda:0",
-    "datadir": "/data/yutong/datasets",
+    "datadir": "/dataMeR2/yutong/datasets",
     "logdir": "./logs/",
     "noise": "0",
     "sample": "1",
