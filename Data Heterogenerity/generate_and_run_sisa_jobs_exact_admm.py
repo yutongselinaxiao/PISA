@@ -6,9 +6,9 @@ OUTPUT_DIR = Path("generated_sisa_exact_admm_runs")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # physical GPU id
-CUDA_DEVICE = "0"
+CUDA_DEVICE = "1"
 
-SIGMA_LR = "1e2"
+# SIGMA_LR = "1e2"
 SEEDS = [0, 1, 2]
 
 # Sweep over initial sigma for per-client runs
@@ -21,7 +21,7 @@ ORIGINAL_ENTRY = "experiment_sisa_practise_online.py"   # fixed
 ORIGINAL_WANDB_ENTRY = "experiment_sisa_practise_wandb.py"    # original
 PERCLIENT_ENTRY = "experiment_sisa_practise_perclient_adaptive_sigma.py"
 
-EXPERIMENT_TAG = f"exact_admm_shared_sigma_pilot_initsig_{SIGMA_LR}_4_7"
+# EXPERIMENT_TAG = f"exact_admm_shared_sigma_pilot_initsig_{SIGMA_LR}_4_7"
 
 COMMON_ARGS = {
     "lr": "0.001",
@@ -57,6 +57,7 @@ ADAPTIVE_EXTRA_ARGS = {
     "eps": "1e-12",
     "sigma_update_freq": "1",
     "sigma_ema_beta": "0.9",
+    "epochs": "3"
 }
 
 HEURISTIC_EXTRA_ARGS = {
@@ -110,11 +111,12 @@ METHODS = [
     #     "entry": ORIGINAL_ENTRY,
     #     "extra_args": FIXED_EXTRA_ARGS,
     # },
-    # {
-    #     "method_name": "adaptive",
-    #     "entry": EXACT_ADMM_ENTRY,
-    #     "extra_args": ADAPTIVE_EXTRA_ARGS,
-    # },
+    {
+        "method_name": "adaptive",
+        "entry": EXACT_ADMM_ENTRY,
+        "extra_args": ADAPTIVE_EXTRA_ARGS,
+        "sweep_sigma": True,
+    },
     # {
     #     "method_name": "heuristic",
     #     "entry": EXACT_ADMM_ENTRY,
@@ -125,12 +127,12 @@ METHODS = [
     #     "entry": ORIGINAL_WANDB_ENTRY,
     #     "extra_args": ORIGINAL_EXTRA_ARGS,
     # },
-    {
-        "method_name": "perclient_convbal",
-        "entry": PERCLIENT_ENTRY,
-        "extra_args": PERCLIENT_CONVBAL_ARGS,
-        "sweep_sigma": True,
-    },
+    # {
+    #     "method_name": "perclient_convbal",
+    #     "entry": PERCLIENT_ENTRY,
+    #     "extra_args": PERCLIENT_CONVBAL_ARGS,
+    #     "sweep_sigma": True,
+    # },
 ]
 
 # safer for first pass
@@ -161,7 +163,7 @@ def build_wandb_names(case: dict, method_name: str, tag: str = None):
     if method_name == "fixed":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_fixed_{t}_seed${{seed}}"
     elif method_name == "adaptive":
-        run_name = f"{case['dataset']}_sig${{sigma_lr}}_convbal_sharedsigma_{t}_seed${{seed}}_diminishing_eta_no_ema"
+        run_name = f"{case['dataset']}_sig${{sigma_lr}}_convbal_sharedsigma_{t}_seed${{seed}}_updated_epochs_3"
     elif method_name == "heuristic":
         run_name = f"{case['dataset']}_sig${{sigma_lr}}_heuristic_{t}_seed${{seed}}_updated"
     elif method_name == "original":

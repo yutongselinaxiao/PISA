@@ -50,16 +50,26 @@ def average_parameters(num_train_env, list_vars, list_alpha):
 
 
 def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha, l2_lambda):
-    W_n_avg = average_parameters(num_batches, W_n_list, alpha)
-    P_n_avg = average_parameters(num_batches, P_n_list, alpha)
-    for i in range(len(W_n_avg)):
-        #W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / tau_lr
-        W_n_avg[i] = (tau_lr*W_n_avg[i] + P_n_avg[i]) / (tau_lr + l2_lambda)
-        W_n_avg[i].detach()
+    # W_n_avg = average_parameters(num_batches, W_n_list, alpha)
+    # P_n_avg = average_parameters(num_batches, P_n_list, alpha)
+    # for i in range(len(W_n_avg)):
+    #     #W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / tau_lr
+    #     W_n_avg[i] = (tau_lr*W_n_avg[i] + P_n_avg[i]) / (tau_lr + l2_lambda)
+    #     W_n_avg[i].detach()
 
-    #del P_n_avg
-    #gc.collect()
-    return W_n_avg
+    # Plain sums: W_global = (sum_i (pi_i + sigma * w_i)) / (lambda + m * sigma)
+    # Matches: w^{k+1} = sum_i(pi_i + sigma_i * w_i) / (lambda + sum_i sigma_i)
+    W_n_sum = [torch.zeros_like(var) for var in W_n_list[0]]
+    P_n_sum = [torch.zeros_like(var) for var in P_n_list[0]]
+    for i in range(num_batches):
+        for j in range(len(W_n_sum)):
+            W_n_sum[j] = W_n_sum[j] + W_n_list[i][j]
+            P_n_sum[j] = P_n_sum[j] + P_n_list[i][j]
+    for j in range(len(W_n_sum)):
+        W_n_sum[j] = (tau_lr * W_n_sum[j] + P_n_sum[j]) / (l2_lambda + num_batches * tau_lr)
+        W_n_sum[j].detach()
+
+    return W_n_sum
 
 def zero_grad(params):
     """
@@ -936,11 +946,11 @@ def diff_global_norm(list_a, list_b):
     return torch.sqrt(total)
 
 
-def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, device="cpu"):
+def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, device="cpu", alpha_i=1.0):
     """
     Approximately solve:
 
-        min_wi F_i(wi) + <pi_i, wi - w_global> + (sigma/2)||wi - w_global||^2
+        min_wi alpha_i * F_i(wi) + <pi_i, wi - w_global> + (sigma/2)||wi - w_global||^2
     """
     with torch.no_grad():
         for p, wg in zip(model.parameters(), w_global):
@@ -976,7 +986,8 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
                 dual_term = dual_term + torch.sum(pi * diff)
                 quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
 
-            loss = task_loss + dual_term + quad_term
+            # loss = task_loss + dual_term + quad_term
+            loss = alpha_i * task_loss + dual_term + quad_term
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
@@ -1352,7 +1363,8 @@ if __name__ == '__main__':
                     pi_local=P_b_initial[sb],
                     sigma_lr=sigma_lr,
                     args=args,
-                    device=device
+                    device=device,
+                    alpha_i=alpha_b[sb]
                 )
 
                 new_W_b.append(W_i_new)

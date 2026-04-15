@@ -42,6 +42,7 @@ import uuid
 import glob
 import time
 from collections import defaultdict
+import wandb
 
 
 # ipdb.set_trace()
@@ -98,7 +99,14 @@ seed = 1337
 comment = 'none'
 algorithm = 'muon'
 #algorithm = 'adamw'
+admm_mode = 'linearized'  # 'linearized' (existing SISA) or 'exact' (exact ADMM inner loop)
+admm_inner_steps = 5  # number of inner gradient steps for exact ADMM mode
+admm_inner_lr = 1e-3  # learning rate for inner loop in exact ADMM mode
 flash_attn = True
+# wandb
+use_wandb = True
+wandb_project = 'gpt2-sisa-online'
+wandb_run_name = None  # auto-generated from comment if None
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -371,17 +379,17 @@ class DistributedOptimizer(torch.optim.Optimizer):
         if self.local_batch_size is None:
             raise RuntimeError("Must call set_local_batch_size() before step()")
 
+        if self.args.admm_mode == 'exact':
+            self._step_exact(closure=closure)
+        else:
+            self._step_linearized(closure=closure)
+
+    def _step_linearized(self, closure=None):
+        """Existing SISA linearized single-step ADMM update."""
         scales = self._compute_layer_penalties()
-        # Store previous global parameters
         prev_W_global = [w.clone() for w in self.params]
 
         use_bf16 = (self._step > self.max_steps - 5)
-        '''if use_bf16:
-            # cast to bfloat16 in a temporary
-            self.updates_flat_w = self.updates_flat_w.to(torch.bfloat16)
-        else:
-            self.updates_flat_w = self.updates_flat_w'''
-        
 
         # 1. Local parameter updates
         with torch.no_grad():
@@ -390,34 +398,17 @@ class DistributedOptimizer(torch.optim.Optimizer):
             beta_rmsprop = self.param_groups[0]['beta_rmsprop']
             zeropower_backend = zeropower_backends['newtonschulz5']
             alpha_b = self._get_alpha()
-            
+
             updates_flat_w = torch.zeros(sum(p.numel() for p in self.params), device=self.device, dtype=torch.float16)
             if use_bf16:
-                # cast to bfloat16 in a temporary
                 updates_flat_w = updates_flat_w.to(torch.bfloat16)
-            else:
-                updates_flat_w = updates_flat_w
             local_w_list = []
             curr_idx = 0
 
-
-            '''for i, (p, w, pb, acc, v,) in enumerate(zip(
-                self.params, self.W_b, self.P_b, self.accumulators, self.momentum
-            )):'''
-            '''for i, (p, pb, acc, v,) in enumerate(zip(
-                self.params, self.P_b, self.accumulators, self.momentum
-            )):'''
-            '''for i, (p, pb) in enumerate(zip(
-                self.params, self.P_b
-            )):'''
             for i, p in enumerate(self.params):
-                # layerwise adaptative rho, sigma
-                #sigma_lr_i = sigma_lr / scales[i] if scales[i] !=0 else sigma_lr
-                #rho_lr_i = rho_lr   / scales[i] if scales[i] !=0 else rho_lr
                 sigma_lr_i = sigma_lr
                 rho_lr_i = rho_lr
-                # Update accumulators
-                
+
                 g = p.grad
                 if g is None:
                     local_w_list.append(prev_W_global[i].detach().clone())
@@ -431,99 +422,127 @@ class DistributedOptimizer(torch.optim.Optimizer):
                     state['momentum_buffer'] = torch.zeros_like(g)
                 buf = state['momentum_buffer']
                 if 'multiplier_buffer' not in state:
-                    #state['multiplier_buffer'] = torch.zeros_like(g)
                     state['multiplier_buffer'] = torch.full_like(p.data, 1e-10)
-                pb = state['multiplier_buffer']  #### memory will not rise
+                pb = state['multiplier_buffer']
                 buf.mul_(self.args.beta1).add_(g)
-                #v.mul_(self.args.beta1).add_(g) # check whether momentum can improve performance
-                '''corrected_v = v / (1 - self.args.beta1**self._step)
-                current_grad_v = corrected_v + pb'''               
-                #g = p.grad
                 g = g.add(buf, alpha=self.args.beta1)
                 g = zeropower_backend(g, steps=5)
-                #g *= max(1, g.size(0)/g.size(1))**0.5
                 if len(g.shape) == 2:
                     g *= max(1, g.size(0)/g.size(1))**0.5
-                #current_grad = g + pb
                 vv = ((pb + g) == 0)
-                current_grad = g + pb + self.args.mu * p.data # mu = 1e-1
-                '''g = p.grad + pb
-                g = zeropower_backend(g, steps=5)
-                g *= max(1, g.size(0)/g.size(1))**0.5
-                current_grad = g'''
-                '''if 'second_moment_buffer' not in state:
-                    state['second_moment_buffer'] = torch.zeros_like(g)
-                acc = state['second_moment_buffer']'''
+                current_grad = g + pb + self.args.mu * p.data
 
-                #current_grad_denom = p.grad + pb + self.args.mu * p.data# p.grad is in the level of 1e-7
-
-                #acc.mul_(beta_rmsprop).addcmul_(current_grad, current_grad, value=(1 - beta_rmsprop)) # this current grad should be corrected as the pb + p.grad(which without any modification)
-                
-                # Compute parameter updates
-                #corrected_acc = acc / (1 - beta_rmsprop**self._step)
-                #corrected_acc = acc
-                #correct_acc_top = acc
-                #correct_acc_top = 1
-
-                #denom = sigma_lr_i + rho_lr_i * (torch.sqrt(corrected_acc) + self.args.epsilon)
                 denom = sigma_lr_i + rho_lr_i*(torch.sqrt(current_grad*current_grad) + self.args.epsilon)
-                #denom = sigma_lr_i + rho_lr_i
 
-                #denom = torch.sqrt(corrected_acc) + self.args.epsilon
-
-                #w.copy_(prev_W_global[i] - (current_grad + self.epsilon_vv**self._step * vv) / denom)
                 w = prev_W_global[i] - (current_grad + self.epsilon_vv**self._step * vv) / denom
-                #w = p - (current_grad + self.epsilon_vv**self._step * vv) / denom
-                pb.copy_((pb.add_(sigma_lr_i * (w - prev_W_global[i]))).mul_(alpha_b)) ### p_scaled = p * alpha
-                #w.mul_(alpha_b)
+                pb.copy_((pb.add_(sigma_lr_i * (w - prev_W_global[i]))).mul_(alpha_b))
                 w *= alpha_b
-                #w.copy_(prev_W_global[i] - current_grad / denom)
-                #w.copy_(prev_W_global[i] - current_grad / denom).mul_(alpha_b)
-                #pb.add_(sigma_lr_i * (w - prev_W_global[i]))
 
-                wpi = sigma_lr*w + pb ### sum first sigma * w + pi first, to reduce memory overhead
+                wpi = sigma_lr*w + pb
                 local_w_list.append(w.detach().clone())
                 updates_flat_w[curr_idx:curr_idx+p.numel()] = wpi.flatten()
-                #self.updates_flat_w[curr_idx:curr_idx+p.numel()] = w.flatten()
-                #self.updates_flat_p[curr_idx:curr_idx+p.numel()] = pb.flatten()
                 curr_idx += p.numel()
 
+        # 2. Global aggregation
+        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global)
 
-                
+    def _step_exact(self, closure=None):
+        """
+        Exact ADMM update: run K inner gradient steps on the augmented Lagrangian
+        per local subproblem, then global aggregate + dual update.
 
-        # 2. Global aggregation with proper alpha weighting
+        Local subproblem for device i:
+            min_{w_i} alpha_i * F_i(w_i) + <pi_i, w_i - w_global> + (sigma/2)||w_i - w_global||^2
+
+        We use the already-computed task gradient (p.grad) as a fixed linear approximation
+        of F_i, then run K steps of gradient descent on the full augmented Lagrangian:
+            grad = alpha_i * task_grad + pi_i + sigma * (w_i - w_global)
+        """
+        prev_W_global = [w.clone() for w in self.params]
+
+        use_bf16 = (self._step > self.max_steps - 5)
+
+        with torch.no_grad():
+            sigma_lr = self.param_groups[0]['sigma_lr']
+            alpha_b = self._get_alpha()
+            inner_lr = self.args.admm_inner_lr
+            K = self.args.admm_inner_steps
+
+            updates_flat_w = torch.zeros(sum(p.numel() for p in self.params), device=self.device, dtype=torch.float16)
+            if use_bf16:
+                updates_flat_w = updates_flat_w.to(torch.bfloat16)
+            local_w_list = []
+            curr_idx = 0
+
+            for i, p in enumerate(self.params):
+                task_grad = p.grad
+                if task_grad is None:
+                    local_w_list.append(prev_W_global[i].detach().clone())
+                    updates_flat_w[curr_idx:curr_idx+p.numel()] = (
+                        (sigma_lr * prev_W_global[i]).flatten().to(updates_flat_w.dtype)
+                    )
+                    curr_idx += p.numel()
+                    continue
+
+                state = self.state[p]
+                if 'multiplier_buffer' not in state:
+                    state['multiplier_buffer'] = torch.full_like(p.data, 1e-10)
+                pb = state['multiplier_buffer']
+
+                # Warm-start w_i from previous local solution or w_global
+                if 'local_w' not in state:
+                    w_i = prev_W_global[i].clone()
+                else:
+                    w_i = state['local_w'].clone()
+
+                w_global = prev_W_global[i]
+
+                # K inner gradient descent steps on augmented Lagrangian
+                for k in range(K):
+                    # grad of augmented Lagrangian w.r.t. w_i:
+                    #   alpha_i * task_grad + pi_i + sigma * (w_i - w_global)
+                    aug_grad = alpha_b * task_grad + pb + sigma_lr * (w_i - w_global)
+                    w_i = w_i - inner_lr * aug_grad
+
+                # Save local solution for warm-starting next iteration
+                state['local_w'] = w_i.detach().clone()
+
+                # 3) Dual update: pi_i += sigma * (w_i - w_global)
+                # Scale by alpha for consistency with the linearized version's convention
+                pb.copy_((pb + sigma_lr * (w_i - w_global)) * alpha_b)
+
+                w_scaled = w_i * alpha_b
+                wpi = sigma_lr * w_scaled + pb
+                local_w_list.append(w_scaled.detach().clone())
+                updates_flat_w[curr_idx:curr_idx+p.numel()] = wpi.flatten()
+                curr_idx += p.numel()
+
+        # 2. Global aggregation (shared with linearized)
+        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global)
+
+    def _global_aggregate(self, updates_flat_w, local_w_list, prev_W_global):
+        """Global aggregation step shared by both linearized and exact modes."""
+        sigma_lr = self.param_groups[0]['sigma_lr']
+
         dist.all_reduce(updates_flat_w, op=dist.ReduceOp.SUM)
-        #dist.all_reduce(self.updates_flat_p, op=dist.ReduceOp.SUM)
-        
+
         curr_idx = 0
         primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
         dual_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
 
-
-        # Use all_reduce for direct weighted summation
-        #for i, (para, w_global) in enumerate(zip(self.params, self.prev_W_global)):
         for i, para in enumerate(self.params):
-            #w_scaled = self.updates_flat_w[curr_idx:curr_idx+para.numel()].view_as(para.data).type_as(para.data)
-            #p_scaled = self.updates_flat_p[curr_idx:curr_idx+para.numel()].view_as(para.data).type_as(para.data)
             wpi = updates_flat_w[curr_idx:curr_idx+para.numel()].view_as(para.data).type_as(para.data)
 
             sigma_lr_i = sigma_lr
-            #new_W = (sigma_lr_i*w_scaled + p_scaled) / (sigma_lr_i+self.args.l2_lambda)
             new_W = wpi / (sigma_lr_i+self.args.l2_lambda)
-            # NEW: primal residual proxy = local/global disagreement
             primal_sq += ((local_w_list[i].to(torch.float32) - new_W.to(torch.float32)) ** 2).sum()
-
-            # NEW: dual residual proxy = global movement
             dual_sq += ((new_W.to(torch.float32) - prev_W_global[i].to(torch.float32)) ** 2).sum()
-
 
             para.data.copy_(new_W)
 
             curr_idx += para.numel()
-        
-        # NEW: save residuals for scheduler
+
         self.last_primal_res = torch.sqrt(primal_sq + 1e-16).item()
-        # scale dual by sigma to mimic ADMM-style dual motion
         self.last_dual_res = (float(sigma_lr) * torch.sqrt(dual_sq + 1e-16)).item()
 
         self._step += 1
@@ -895,17 +914,20 @@ if init_from == 'resume':
 
 @dataclass
 class Hyperparameters:
-    ### this set of sigma_lr and rho_lr keep the same 
+    ### this set of sigma_lr and rho_lr keep the same
     sigma_lr: float = 8e1 # 8e1 best in last version   #8e2 best in current version
-    rho_lr: float = 1e2  #3e3   
+    rho_lr: float = 1e2  #3e3
     beta1: float = 0.95 #0.75 0.95 for best
     beta_rmsprop: float = 0.9 #0.999 and 0.99 does not differ too much
     gamma: float = 0.99
     l2_lambda: float = 0# 1e-1
     mu: float = 0 # 5e-2
     epsilon: float = 1e-8
+    admm_mode: str = 'linearized'  # 'linearized' or 'exact'
+    admm_inner_steps: int = 5      # inner loop steps for exact ADMM
+    admm_inner_lr: float = 1e-3    # inner loop lr for exact ADMM
 
-args = Hyperparameters()
+args = Hyperparameters(admm_mode=admm_mode, admm_inner_steps=admm_inner_steps, admm_inner_lr=admm_inner_lr)
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -957,7 +979,13 @@ sched_sigma_rho = SigmaRhoScheduler(
     stabilize_start=300,
     adapt_every=1,
 )
-# logging
+# wandb init
+if use_wandb and master_process:
+    wandb.init(
+        project=wandb_project,
+        name=wandb_run_name or f"{comment}_{admm_mode}",
+        config=config,
+    )
 
 def train():
     global iter_num, x, y
@@ -1019,6 +1047,11 @@ def train():
                 print(f'step:{step}/{num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
                 val_loss_record.append(val_loss)
                 train_time_record.append(training_time_ms)
+                if use_wandb:
+                    wandb.log({
+                        "val/loss": val_loss.item(),
+                        "val/training_time_ms": training_time_ms,
+                    }, step=step)
             # start the clock again
             torch.cuda.synchronize()
             t0 = time.time()
@@ -1075,6 +1108,23 @@ def train():
         if master_process:
             approx_time = training_time_ms + 1000 * (time.time() - t0)
             print(f"step:{step+1}/{num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+            if use_wandb:
+                log_dict = {
+                    "train/loss": train_loss.item(),
+                    "admm/sigma_lr": optimizer2_2.param_groups[0]['sigma_lr'],
+                    "admm/rho_lr": optimizer2_2.param_groups[0]['rho_lr'],
+                    "lr/adam": optimizer1.param_groups[0]['lr'],
+                }
+                if optimizer2_2.last_primal_res is not None:
+                    log_dict["admm/primal_residual"] = optimizer2_2.last_primal_res
+                    log_dict["admm/dual_residual"] = optimizer2_2.last_dual_res
+                    log_dict["admm/primal_dual_ratio"] = (
+                        optimizer2_2.last_primal_res / max(optimizer2_2.last_dual_res, 1e-16)
+                    )
+                if sched_sigma_rho.primal_ema is not None:
+                    log_dict["admm/primal_ema"] = sched_sigma_rho.primal_ema
+                    log_dict["admm/dual_ema"] = sched_sigma_rho.dual_ema
+                wandb.log(log_dict, step=step)
 
         iter_num += 1
         local_iter_num += 1
@@ -1086,6 +1136,8 @@ def train():
     if master_process:
         np.savetxt(save_path_val, np.array([t.cpu().item() for t in val_loss_record]), fmt='%.6f')
         np.savetxt(save_path_time, np.array(train_time_record), fmt='%.6f')
+        if use_wandb:
+            wandb.finish()
     if ddp:
         destroy_process_group()
 
