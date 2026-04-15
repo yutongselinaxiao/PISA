@@ -102,6 +102,8 @@ algorithm = 'muon'
 admm_mode = 'linearized'  # 'linearized' (existing SISA) or 'exact' (exact ADMM inner loop)
 admm_inner_steps = 5  # number of inner gradient steps for exact ADMM mode
 admm_inner_lr = 1e-3  # learning rate for inner loop in exact ADMM mode
+sigma_adapt_mode = 'convex_bal'  # 'convex_bal' or 'task_aware'
+task_lambda = 1.0  # weight of task-awareness term (only used when sigma_adapt_mode='task_aware')
 flash_attn = True
 # wandb
 use_wandb = True
@@ -570,6 +572,8 @@ class SigmaRhoScheduler:
         stabilize_start: int = 200,
         eps: float = 1e-12,
         adapt_every: int = 1,
+        sigma_adapt_mode: str = 'convex_bal',
+        task_lambda: float = 1.0,
     ):
         self.dist_opt = dist_opt
         self.adam_opt = adam_opt
@@ -588,6 +592,8 @@ class SigmaRhoScheduler:
         self.stabilize_start = stabilize_start
         self.eps = eps
         self.adapt_every = adapt_every
+        self.sigma_adapt_mode = sigma_adapt_mode
+        self.task_lambda = task_lambda
 
         # fixed ratio rho / sigma
         self.rho_over_sigma = self.base_rho / max(self.base_sigma, eps)
@@ -595,6 +601,13 @@ class SigmaRhoScheduler:
         self.step_num = 0
         self.primal_ema = None
         self.dual_ema = None
+        self.prev_train_loss = None
+
+        # task-aware diagnostics (for wandb logging)
+        self.ta_total_loss = None
+        self.ta_res_loss = None
+        self.ta_task_loss = None
+        self.ta_loss_increase = None
 
         # initialize log-sigma around the base schedule
         self.log_sigma = math.log(max(self.base_sigma, self.eps))
@@ -606,7 +619,7 @@ class SigmaRhoScheduler:
         rho_base = scale * self.base_rho
         return sigma_base, rho_base
 
-    def step(self):
+    def step(self, train_loss=None):
         sigma_base, rho_base = self._base_schedule()
 
         # start from base schedule if no residuals yet
@@ -634,24 +647,66 @@ class SigmaRhoScheduler:
             old_u = self.log_sigma
             base_u = math.log(max(sigma_base, self.eps))
 
-            # deadband late in training
-            if not (self.step_num >= self.stabilize_start and abs(imbalance) < self.deadband):
-                # convex-bal style target: correct around the LR-coupled base schedule
-                # positive imbalance -> larger sigma, negative imbalance -> smaller sigma
+            if self.sigma_adapt_mode == 'convex_bal':
+                # deadband late in training
+                if not (self.step_num >= self.stabilize_start and abs(imbalance) < self.deadband):
+                    # convex-bal style target: correct around the LR-coupled base schedule
+                    # positive imbalance -> larger sigma, negative imbalance -> smaller sigma
+                    eta_k = self.eta_u / math.sqrt(self.step_num + 1.0)
+                    u_candidate = base_u + eta_k * imbalance
+
+                    # shrinking trust region
+                    max_delta_k = max(self.max_delta_min, self.max_delta / math.sqrt(self.step_num + 1.0))
+                    u_candidate = min(max(u_candidate, old_u - max_delta_k), old_u + max_delta_k)
+
+                    # damped blending
+                    blend_k = max(self.blend_min, self.blend / math.sqrt(self.step_num + 1.0))
+                    u_new = (1.0 - blend_k) * old_u + blend_k * u_candidate
+
+                    # projection
+                    u_new = min(max(u_new, math.log(self.sigma_min)), math.log(self.sigma_max))
+                    self.log_sigma = u_new
+
+            elif self.sigma_adapt_mode == 'task_aware':
+                # Task-aware online loss:
+                # L(u) = (u - target)^2 + task_lambda * relu(loss_curr - loss_prev) * |u - target|
+                # target = base_u + imbalance (same direction as convex_bal)
+                target_u = base_u + imbalance
+                diff = old_u - target_u
+
+                # Residual balance gradient
+                grad_residual = 2.0 * diff
+
+                # Task-awareness gradient: activated when train loss increases
+                loss_increase = 0.0
+                if train_loss is not None:
+                    cur_loss = float(train_loss)
+                    if self.prev_train_loss is not None:
+                        loss_increase = max(0.0, cur_loss - self.prev_train_loss)
+                    self.prev_train_loss = cur_loss
+
+                grad_task = loss_increase * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+
+                # Combined gradient
+                grad_u = grad_residual + self.task_lambda * grad_task
+                grad_u = max(-10.0, min(10.0, grad_u))  # clip
+
                 eta_k = self.eta_u / math.sqrt(self.step_num + 1.0)
-                u_candidate = base_u + eta_k * imbalance
+                u_new = old_u - eta_k * grad_u
 
-                # shrinking trust region
+                # shrinking trust region (same as convex_bal)
                 max_delta_k = max(self.max_delta_min, self.max_delta / math.sqrt(self.step_num + 1.0))
-                u_candidate = min(max(u_candidate, old_u - max_delta_k), old_u + max_delta_k)
-
-                # damped blending
-                blend_k = max(self.blend_min, self.blend / math.sqrt(self.step_num + 1.0))
-                u_new = (1.0 - blend_k) * old_u + blend_k * u_candidate
+                u_new = min(max(u_new, old_u - max_delta_k), old_u + max_delta_k)
 
                 # projection
                 u_new = min(max(u_new, math.log(self.sigma_min)), math.log(self.sigma_max))
                 self.log_sigma = u_new
+
+                # diagnostics for wandb
+                self.ta_res_loss = diff ** 2
+                self.ta_task_loss = loss_increase * abs(diff)
+                self.ta_total_loss = self.ta_res_loss + self.task_lambda * self.ta_task_loss
+                self.ta_loss_increase = loss_increase
 
             sigma_t = math.exp(self.log_sigma)
 
@@ -926,8 +981,11 @@ class Hyperparameters:
     admm_mode: str = 'linearized'  # 'linearized' or 'exact'
     admm_inner_steps: int = 5      # inner loop steps for exact ADMM
     admm_inner_lr: float = 1e-3    # inner loop lr for exact ADMM
+    sigma_adapt_mode: str = 'convex_bal'  # 'convex_bal' or 'task_aware'
+    task_lambda: float = 1.0       # weight of task-awareness term
 
-args = Hyperparameters(admm_mode=admm_mode, admm_inner_steps=admm_inner_steps, admm_inner_lr=admm_inner_lr)
+args = Hyperparameters(admm_mode=admm_mode, admm_inner_steps=admm_inner_steps, admm_inner_lr=admm_inner_lr,
+                       sigma_adapt_mode=sigma_adapt_mode, task_lambda=task_lambda)
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -978,6 +1036,8 @@ sched_sigma_rho = SigmaRhoScheduler(
     deadband=0.03,
     stabilize_start=300,
     adapt_every=1,
+    sigma_adapt_mode=sigma_adapt_mode,
+    task_lambda=task_lambda,
 )
 # wandb init
 if use_wandb and master_process:
@@ -1006,6 +1066,7 @@ def train():
     save_path_val = os.path.join(save_dir, f'val_loss_record_{admm_mode}.txt')
     train_time_record = []
     save_path_time = os.path.join(save_dir, f'train_time_record_{admm_mode}.txt')
+    train_loss = None
     for step in range(num_iterations + 1):
         # determine and set the learning rate for this iteration
         last_step = (step == num_iterations)
@@ -1062,7 +1123,7 @@ def train():
             break
 
         model.train()
-        sched_sigma_rho.step()
+        sched_sigma_rho.step(train_loss=train_loss.item() if train_loss is not None else None)
 
         with model.no_sync():
             for micro_step in range(1, gradient_accumulation_steps+1):
@@ -1125,6 +1186,11 @@ def train():
                 if sched_sigma_rho.primal_ema is not None:
                     log_dict["admm/primal_ema"] = sched_sigma_rho.primal_ema
                     log_dict["admm/dual_ema"] = sched_sigma_rho.dual_ema
+                if sched_sigma_rho.ta_total_loss is not None:
+                    log_dict["admm/ta_total_loss"] = sched_sigma_rho.ta_total_loss
+                    log_dict["admm/ta_residual_loss"] = sched_sigma_rho.ta_res_loss
+                    log_dict["admm/ta_task_loss"] = sched_sigma_rho.ta_task_loss
+                    log_dict["admm/ta_loss_increase"] = sched_sigma_rho.ta_loss_increase
                 wandb.log(log_dict, step=step)
 
         iter_num += 1
