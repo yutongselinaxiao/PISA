@@ -87,8 +87,8 @@ muon_learning_rate : float = 0.002
 warmup_iters : int = 0
 warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
 weight_decay : float = 0
-input_bin : str = 'data/fineweb10B/fineweb_train_*.bin'
-input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin'
+input_bin : str = '/dataMeR2/yutong/fineweb10B/fineweb_train_*.bin'
+input_val_bin : str = '/dataMeR2/yutong/fineweb10B/fineweb_val_*.bin'
 grad_clip = 1.0 # clip gradients at this value, or disable if == 0.0
 # learning rate decay settings
 decay_lr = True # whether to decay the learning rate
@@ -985,6 +985,7 @@ if use_wandb and master_process:
         project=wandb_project,
         name=wandb_run_name or comment,
         config=config,
+        dir = save_dir
     )
 
 def train():
