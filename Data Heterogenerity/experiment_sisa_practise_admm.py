@@ -50,26 +50,32 @@ def average_parameters(num_train_env, list_vars, list_alpha):
 
 
 def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha, l2_lambda):
-    # W_n_avg = average_parameters(num_batches, W_n_list, alpha)
-    # P_n_avg = average_parameters(num_batches, P_n_list, alpha)
-    # for i in range(len(W_n_avg)):
-    #     #W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / tau_lr
-    #     W_n_avg[i] = (tau_lr*W_n_avg[i] + P_n_avg[i]) / (tau_lr + l2_lambda)
-    #     W_n_avg[i].detach()
+    # --- Alpha on whole augmented Lagrangian term ---
+    # Derived from: min_w lambda/2 ||w||^2 + sum_i alpha_i [<pi_i, w_i - w> + sigma/2 ||w_i - w||^2]
+    # Global update: w = (sigma * sum_i(alpha_i * w_i) + sum_i(alpha_i * pi_i)) / (lambda + sigma * sum_i(alpha_i))
+    # Since sum_i(alpha_i) = 1, denominator = lambda + sigma
+    W_n_avg = average_parameters(num_batches, W_n_list, alpha)
+    P_n_avg = average_parameters(num_batches, P_n_list, alpha)
+    for i in range(len(W_n_avg)):
+        W_n_avg[i] = (tau_lr*W_n_avg[i] + P_n_avg[i]) / (tau_lr + l2_lambda)
+        W_n_avg[i].detach()
 
-    # Plain sums: W_global = (sum_i (pi_i + sigma * w_i)) / (lambda + m * sigma)
-    # Matches: w^{k+1} = sum_i(pi_i + sigma_i * w_i) / (lambda + sum_i sigma_i)
-    W_n_sum = [torch.zeros_like(var) for var in W_n_list[0]]
-    P_n_sum = [torch.zeros_like(var) for var in P_n_list[0]]
-    for i in range(num_batches):
-        for j in range(len(W_n_sum)):
-            W_n_sum[j] = W_n_sum[j] + W_n_list[i][j]
-            P_n_sum[j] = P_n_sum[j] + P_n_list[i][j]
-    for j in range(len(W_n_sum)):
-        W_n_sum[j] = (tau_lr * W_n_sum[j] + P_n_sum[j]) / (l2_lambda + num_batches * tau_lr)
-        W_n_sum[j].detach()
+    # --- [COMMENTED OUT] Alpha only on F_i (not on dual/quad terms) ---
+    # Derived from: min_w lambda/2 ||w||^2 + sum_i [<pi_i, w_i - w> + sigma/2 ||w_i - w||^2]
+    # Global update: w = (sigma * sum_i(w_i) + sum_i(pi_i)) / (lambda + m * sigma)
+    # Difference: here alpha does NOT weight the consensus penalty, so the global
+    # update uses plain sums instead of alpha-weighted averages.
+    # W_n_sum = [torch.zeros_like(var) for var in W_n_list[0]]
+    # P_n_sum = [torch.zeros_like(var) for var in P_n_list[0]]
+    # for i in range(num_batches):
+    #     for j in range(len(W_n_sum)):
+    #         W_n_sum[j] = W_n_sum[j] + W_n_list[i][j]
+    #         P_n_sum[j] = P_n_sum[j] + P_n_list[i][j]
+    # for j in range(len(W_n_sum)):
+    #     W_n_sum[j] = (tau_lr * W_n_sum[j] + P_n_sum[j]) / (l2_lambda + num_batches * tau_lr)
+    #     W_n_sum[j].detach()
 
-    return W_n_sum
+    return W_n_avg
 
 def zero_grad(params):
     """
@@ -986,8 +992,11 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
                 dual_term = dual_term + torch.sum(pi * diff)
                 quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
 
-            # loss = task_loss + dual_term + quad_term
-            loss = alpha_i * task_loss + dual_term + quad_term
+            # --- Alpha on whole augmented Lagrangian term ---
+            # loss = alpha_i * (F_i + <pi, w-w_g> + sigma/2 ||w-w_g||^2)
+            loss = alpha_i * (task_loss + dual_term + quad_term)
+            # --- [COMMENTED OUT] Alpha only on F_i ---
+            # loss = alpha_i * task_loss + dual_term + quad_term
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
