@@ -427,6 +427,11 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 
                 g = p.grad
                 if g is None:
+                    local_w_list.append(prev_W_global[i].detach().clone())
+                    updates_flat_w[curr_idx:curr_idx+p.numel()] = (
+                        (sigma_lr * prev_W_global[i]).flatten().to(updates_flat_w.dtype)
+                    )
+                    curr_idx += p.numel()
                     continue
                 state = self.state[p]
                 if 'momentum_buffer' not in state:
