@@ -489,6 +489,7 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 #pb.add_(sigma_lr_i * (w - prev_W_global[i]))
 
                 wpi = sigma_lr*w + pb ### sum first sigma * w + pi first, to reduce memory overhead
+                local_w_list.append(w.detach().clone())
                 updates_flat_w[curr_idx:curr_idx+p.numel()] = wpi.flatten()
                 #self.updates_flat_w[curr_idx:curr_idx+p.numel()] = w.flatten()
                 #self.updates_flat_p[curr_idx:curr_idx+p.numel()] = pb.flatten()
