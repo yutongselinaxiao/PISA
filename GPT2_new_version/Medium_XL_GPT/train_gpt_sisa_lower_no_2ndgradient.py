@@ -815,7 +815,7 @@ if init_from == 'resume':
 @dataclass
 class Hyperparameters:
     ### this set of sigma_lr and rho_lr keep the same 
-    sigma_lr: float = 8e1 # 8e1 best in last version   #8e2 best in current version
+    sigma_lr: float = 8e2 # 8e1 best in last version   #8e2 best in current version
     rho_lr: float = 1e2  #3e3   
     beta1: float = 0.95 #0.75 0.95 for best
     beta_rmsprop: float = 0.9 #0.999 and 0.99 does not differ too much

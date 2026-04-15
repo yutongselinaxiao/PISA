@@ -6,7 +6,7 @@ OUTPUT_DIR = Path("generated_sisa_task_aware_runs")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # physical GPU ids to distribute work across
-CUDA_DEVICES = ["0", "1", "2", "3"]
+CUDA_DEVICES = ["0", "2", "3"]
 
 SEEDS = [0, 1, 2]
 

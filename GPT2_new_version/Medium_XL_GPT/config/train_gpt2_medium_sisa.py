@@ -34,7 +34,7 @@ decay_lr = True # whether to decay the learning rate
 min_lr = 6e-5 
 
 
-comment = 'gpt2_medium_sisa' 
+comment = 'gpt2_medium_sisa_sigma0_800' 
 # save_dir = 'log_gpt2/'+comment
 # out_dir = 'out_gpt2/' +comment # save ckpt
 save_dir = '/dataMeR2/yutong/sisa_gpt2/log_gpt2/'+comment
