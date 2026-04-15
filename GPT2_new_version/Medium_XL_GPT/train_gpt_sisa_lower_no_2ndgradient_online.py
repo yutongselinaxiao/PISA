@@ -983,7 +983,7 @@ sched_sigma_rho = SigmaRhoScheduler(
 if use_wandb and master_process:
     wandb.init(
         project=wandb_project,
-        name=wandb_run_name or f"{comment}_{admm_mode}",
+        name=wandb_run_name or comment,
         config=config,
     )
 
@@ -1002,9 +1002,9 @@ def train():
     #while True:
     train_loader.reset()
     val_loss_record = []
-    save_path_val = "/workspace0/ow120/DDAM/Adam-mini/examples/gpt2/experiment_results/sisa_submit/val_loss_record_no2g_adagrad.txt"
+    save_path_val = os.path.join(save_dir, f'val_loss_record_{admm_mode}.txt')
     train_time_record = []
-    save_path_time = "/workspace0/ow120/DDAM/Adam-mini/examples/gpt2/experiment_results/sisa_submit/train_time_record_no2g_adagrad.txt"
+    save_path_time = os.path.join(save_dir, f'train_time_record_{admm_mode}.txt')
     for step in range(num_iterations + 1):
         # determine and set the learning rate for this iteration
         last_step = (step == num_iterations)
