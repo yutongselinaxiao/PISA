@@ -1201,6 +1201,10 @@ if __name__ == '__main__':
             config=vars(args),
             reinit=True,
         )
+        # auto-aggregate best/last for the main table + sensitivity plot
+        wandb.define_metric("test/acc", summary="max")
+        wandb.define_metric("test/acc", summary="last")
+        wandb.define_metric("train/acc", summary="last")
     X_train, y_train, X_test, y_test, net_dataidx_map, traindata_cls_counts = partition_data(
         args.dataset, args.datadir, args.logdir, args.partition, args.n_parties, beta=args.beta)
 
@@ -1711,6 +1715,13 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
+            if args.use_wandb:
+                wandb.log({
+                    "round": round,
+                    "test/acc": test_acc,
+                    "train/acc": train_acc,
+                }, step=round)
+
 
     elif args.alg == 'fedprox':
         logger.info("Initializing nets")
@@ -1769,6 +1780,13 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
+            if args.use_wandb:
+                wandb.log({
+                    "round": round,
+                    "test/acc": test_acc,
+                    "train/acc": train_acc,
+                }, step=round)
 
     elif args.alg == 'scaffold':
         logger.info("Initializing nets")
@@ -1832,6 +1850,13 @@ if __name__ == '__main__':
 
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
+
+            if args.use_wandb:
+                wandb.log({
+                    "round": round,
+                    "test/acc": test_acc,
+                    "train/acc": train_acc,
+                }, step=round)
 
     elif args.alg == 'fednova':
         logger.info("Initializing nets")
@@ -1926,6 +1951,13 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
+            if args.use_wandb:
+                wandb.log({
+                    "round": round,
+                    "test/acc": test_acc,
+                    "train/acc": train_acc,
+                }, step=round)
+
     elif args.alg == 'moon':
         logger.info("Initializing nets")
         nets, local_model_meta_data, layer_type = init_nets(args.net_config, args.dropout_p, args.n_parties, args)
@@ -1989,6 +2021,13 @@ if __name__ == '__main__':
             logger.info('>> Global Model Train accuracy: %f' % train_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
+            if args.use_wandb:
+                wandb.log({
+                    "round": round,
+                    "test/acc": test_acc,
+                    "train/acc": train_acc,
+                }, step=round)
+
             old_nets = copy.deepcopy(nets)
             for _, net in old_nets.items():
                 net.eval()
@@ -2013,4 +2052,6 @@ if __name__ == '__main__':
 
         logger.info("All in test acc: %f" % testacc)
 
-   
+    if args.use_wandb and wandb_run is not None:
+        wandb.finish()
+

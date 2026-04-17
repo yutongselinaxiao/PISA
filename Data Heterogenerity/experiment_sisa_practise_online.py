@@ -1542,7 +1542,8 @@ if __name__ == '__main__':
                         u=u,
                         primal_res=torch.tensor(avg_primal_res, device=device),
                         delta_y=torch.tensor(avg_delta_y, device=device),
-                        eta_u=eta_u/(epoch+1),  # decay learning rate over epochs
+                        # eta_u=eta_u/(epoch+1),  # decay learning rate over epochs
+                        eta_u=eta_u,  # changed to fixed eta_u on April 16th
                         G_clip=G_clip,
                         u_min=math.log(sigma_min),
                         u_max=math.log(sigma_max),
