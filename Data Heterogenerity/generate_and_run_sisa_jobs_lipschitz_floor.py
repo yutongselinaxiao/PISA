@@ -1,12 +1,18 @@
 """Generator for the Lipschitz-floor (hard-projection) adaptive-sigma pilot.
 
-Cases: {mnist, fmnist} x {label1, label3} x sigma_0 in {1e2, 1e3, 1e4}.
+Cases: {mnist, fmnist} x {label1, label3} x sigma_0 in {1e2, 1e3, 1e4}
+       x lipschitz_estimator in ESTIMATORS.
 Each script runs 3 seeds sequentially. Scripts are distributed round-robin
 across the GPUs listed in CUDA_DEVICES and launched in parallel.
 
 The core claim under test: with --sigma_mode online_convex_bal_lipschitz (hard
 projection onto {u >= log L_hat}), the final test accuracy is insensitive to
 sigma_0 -- all three initial values should converge to similar accuracy.
+
+Secondary pilot (2026-04-19): on fmnist, the EMA estimator overshoots by ~20x
+and pins sigma too high. `running_min` over a fixed window is a candidate fix
+that does not introduce a new scalar knob (only a window size). EMA stays as
+the default for backward compat; this sweep runs both side-by-side.
 """
 
 import stat
@@ -21,6 +27,11 @@ CUDA_DEVICES = ["4", "5", "6", "7"]
 SEEDS = [0, 1, 2]
 
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
+
+# Estimator sweep. ema = historical behavior; running_min is the candidate
+# fmnist fix (window size below). Comment out entries to shrink the sweep.
+ESTIMATORS = ["ema", "running_min"]
+LIPSCHITZ_WINDOW_SIZE = "20"
 
 ONLINE_ENTRY = "experiment_sisa_practise_online.py"
 
@@ -43,7 +54,7 @@ COMMON_ARGS = {
     "l2_lambda": "5e-3",
     "init_seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "paper-lipschitz-floor",
+    "wandb_project": "paper-lipschitz-estimator",
 }
 
 LIPSCHITZ_EXTRA_ARGS = {
@@ -53,6 +64,8 @@ LIPSCHITZ_EXTRA_ARGS = {
     "eta_u": "0.05",
     "G_clip": "5.0",
     "rho_lr": "1e2",
+    "lipschitz_estimator": "${estimator}",
+    "lipschitz_window_size": LIPSCHITZ_WINDOW_SIZE,
     "lipschitz_ema_beta": "0.9",
     "lipschitz_min_dz": "1e-6",
     "lipschitz_max": "1e8",
@@ -82,13 +95,13 @@ def make_executable(path: Path):
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def make_experiment_tag(sigma_lr_val: str) -> str:
-    return f"lipschitz_sig{sigma_lr_val}"
+def make_experiment_tag(sigma_lr_val: str, estimator: str) -> str:
+    return f"lipschitz_{estimator}_sig{sigma_lr_val}"
 
 
 def build_wandb_names(case: dict, tag: str):
     group = f"{case['case_name']}-{tag}"
-    run_name = f"{case['dataset']}_sig${{sigma_lr}}_{tag}_seed${{seed}}"
+    run_name = f"{case['dataset']}_{tag}_seed${{seed}}"
     return group, run_name
 
 
@@ -114,7 +127,8 @@ def build_command(case: dict, tag: str, cuda_device: str) -> str:
     return "\n".join(lines)
 
 
-def build_script_text(case: dict, sigma_lr: str, tag: str, cuda_device: str) -> str:
+def build_script_text(case: dict, sigma_lr: str, estimator: str,
+                      tag: str, cuda_device: str) -> str:
     cmd = build_command(case, tag=tag, cuda_device=cuda_device)
     header = [
         "#!/bin/bash",
@@ -122,6 +136,7 @@ def build_script_text(case: dict, sigma_lr: str, tag: str, cuda_device: str) -> 
         "set -e",
         "",
         f"sigma_lr={sigma_lr}",
+        f"estimator={estimator}",
         "",
         "for seed in 0 1 2",
         "do",
@@ -138,16 +153,19 @@ def main():
 
     jobs = []
     for case in CASES:
-        for slr in SIGMA_LR_VALUES:
-            tag = make_experiment_tag(slr)
-            jobs.append((case, slr, tag))
+        for estimator in ESTIMATORS:
+            for slr in SIGMA_LR_VALUES:
+                tag = make_experiment_tag(slr, estimator)
+                jobs.append((case, slr, estimator, tag))
 
     generated_scripts = []
-    for idx, (case, slr, tag) in enumerate(jobs):
+    for idx, (case, slr, estimator, tag) in enumerate(jobs):
         gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
         script_name = f"{case['case_name']}_{tag}.sh"
         script_path = OUTPUT_DIR / script_name
-        script_text = build_script_text(case, sigma_lr=slr, tag=tag, cuda_device=gpu)
+        script_text = build_script_text(
+            case, sigma_lr=slr, estimator=estimator, tag=tag, cuda_device=gpu
+        )
         script_path.write_text(script_text, encoding="utf-8")
         make_executable(script_path)
         generated_scripts.append(script_path)

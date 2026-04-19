@@ -434,6 +434,15 @@ def get_args():
     # Empirical finding: soft quadratic floor required lambda_L ~ 100 to
     # converge on label=1, i.e. the data wanted the hard-projection limit.
     # Hard projection is exactly that limit; it also simplifies the proof.
+    parser.add_argument('--lipschitz_estimator', type=str, default='ema',
+                        choices=['ema', 'running_min', 'running_median'],
+                        help='smoothing rule for BB-type Lipschitz estimate. '
+                             'ema (default) is the historical behavior. '
+                             'running_min/running_median use a fixed-size window '
+                             'and are less sensitive to transient spikes.')
+    parser.add_argument('--lipschitz_window_size', type=int, default=20,
+                        help='window size for running_min / running_median estimators '
+                             '(ignored when lipschitz_estimator=ema)')
     parser.add_argument('--lipschitz_ema_beta', type=float, default=0.9,
                         help='EMA smoothing factor for BB-type Lipschitz estimate '
                              '(L_hat_ema = beta*L_hat_ema + (1-beta)*L_hat_raw)')
@@ -1448,12 +1457,15 @@ if __name__ == '__main__':
 
         # ---- State for online_convex_bal_lipschitz (BB Lipschitz floor) ----
         # Always initialized; only consumed when sigma_mode matches.
+        lipschitz_estimator = getattr(args, "lipschitz_estimator", "ema")
+        lipschitz_window_size = getattr(args, "lipschitz_window_size", 20)
         lipschitz_ema_beta = getattr(args, "lipschitz_ema_beta", 0.9)
         lipschitz_min_dz = getattr(args, "lipschitz_min_dz", 1e-6)
         lipschitz_max = getattr(args, "lipschitz_max", 1e8)
         grad_global_prev = None  # sum_i alpha_i * grad F_i(z^{k-1})
         z_prev_bb = [w.clone().detach() for w in W_global]  # z^{k-1}
         L_hat_ema = torch.tensor(0.0, device=device)
+        L_hat_buffer = []  # ring buffer of raw L_hat samples, for running_min/median
 
         for epoch in range(args.comm_round):
             epoch_train_correct = 0
@@ -1633,9 +1645,29 @@ if __name__ == '__main__':
                                     dg_tensors.append(a.detach() - b.detach())
                             dg_norm = global_norm(dg_tensors)
                             L_hat_raw = torch.clamp(dg_norm / dz_norm, max=lipschitz_max)
+                            # Always update EMA state (cheap; used when estimator=ema).
                             L_hat_ema = (lipschitz_ema_beta * L_hat_ema
                                          + (1.0 - lipschitz_ema_beta) * L_hat_raw)
-                    L_hat_tensor = L_hat_ema.clone()
+                            # Always update the ring buffer (used by running_min/median).
+                            L_hat_buffer.append(float(L_hat_raw.item()))
+                            if len(L_hat_buffer) > lipschitz_window_size:
+                                L_hat_buffer.pop(0)
+                    # Dispatch on estimator choice. Before any raw sample lands (buffer
+                    # empty), running_* fall back to L_hat=0 -> floor inactive.
+                    if lipschitz_estimator == "ema":
+                        L_hat_tensor = L_hat_ema.clone()
+                    elif lipschitz_estimator == "running_min" and len(L_hat_buffer) > 0:
+                        L_hat_tensor = torch.tensor(min(L_hat_buffer), device=device)
+                    elif lipschitz_estimator == "running_median" and len(L_hat_buffer) > 0:
+                        sorted_buf = sorted(L_hat_buffer)
+                        n = len(sorted_buf)
+                        if n % 2 == 0:
+                            med = 0.5 * (sorted_buf[n // 2 - 1] + sorted_buf[n // 2])
+                        else:
+                            med = sorted_buf[n // 2]
+                        L_hat_tensor = torch.tensor(med, device=device)
+                    else:
+                        L_hat_tensor = torch.tensor(0.0, device=device)
 
             # if epoch % 10 == 0 and 0 < epoch:
             if epoch % 1 == 0 and 0 < epoch:
@@ -1780,6 +1812,7 @@ if __name__ == '__main__':
                         log_dict["sigma/grad_u"] = grad_u.item()
                     if L_hat_tensor is not None:
                         log_dict["sigma/L_hat_ema"] = float(L_hat_tensor.item())
+                    log_dict["sigma/L_hat_buffer_size"] = len(L_hat_buffer)
 
                 wandb.log(log_dict, step=epoch)
 
