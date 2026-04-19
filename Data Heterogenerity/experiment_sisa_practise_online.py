@@ -106,7 +106,6 @@ def online_convex_bal_lipschitz_update_u(
     primal_res,
     delta_y,
     L_hat,
-    lambda_L=1.0,
     eta_u=0.05,
     G_clip=10.0,
     u_min=-20.0,
@@ -114,16 +113,24 @@ def online_convex_bal_lipschitz_update_u(
     eps=1e-12,
 ):
     """
-    Residual-balance online update on u = log(sigma) augmented with a
-    one-sided quadratic Lipschitz floor:
+    Residual-balance online update on u = log(sigma) with a HARD Lipschitz
+    projection enforcing sigma >= L_hat:
 
-        L(u) = 0.5 * (u - (log r - log dy))^2
-             + 0.5 * lambda_L * max(0, log(L_hat) - u)^2
+        u_raw = u - eta_u * grad_res(u)                      # OGD step on 0.5*(u - tau)^2
+        u_new = max(u_raw, log(L_hat))                        # hard projection
+        u_new = clamp(u_new, u_min, u_max)                    # global bounds
 
-    The floor term activates only when sigma < L_hat (observed local
-    Lipschitz of the global gradient), forcing sigma above the
-    linearized-ADMM instability threshold. Inactive when sigma >= L_hat,
-    reducing to plain residual balance.
+    DESIGN NOTE (2026-04-19): this replaces an earlier soft quadratic floor
+    parameterized by lambda_L. Empirically we found lambda_L needed to be
+    large (~100) for convergence on label=1 / MNIST; i.e. the data preferred
+    the hard-projection limit lambda_L -> inf. Hard projection eliminates
+    lambda_L entirely (one fewer knob), simplifies the proof (Claim 1 is
+    trivial: one step enters the feasible set), and preserves Claim 2's
+    descent guarantee (only needs sigma_k >= L_hat_k, which hard projection
+    enforces exactly). See adaptive_sigma_lipschitz_proof.tex.
+
+    Floor is inactive (u_new == u_raw) when u_raw >= log(L_hat), i.e. in the
+    exact-ADMM regime where the penalty already dominates Lipschitz.
     """
     r_clip = torch.clamp(primal_res, min=eps)
     dy_clip = torch.clamp(delta_y, min=eps)
@@ -134,27 +141,18 @@ def online_convex_bal_lipschitz_update_u(
 
     diff = u - target
     res_loss = diff.pow(2)
-    grad_res = 2.0 * diff
-
-    gap = log_L - u
-    gap_pos = gap.clamp(min=0.0)
-    floor_active = (gap > 0).to(gap.dtype)
-    floor_loss = 0.5 * lambda_L * gap_pos.pow(2)
-    grad_floor = -lambda_L * gap_pos  # d/du of 0.5*lambda*(log_L - u)^2_+
-
-    total_loss = res_loss + floor_loss
-    grad_u = grad_res + grad_floor
+    grad_u = 2.0 * diff
     grad_u = torch.clamp(grad_u, -G_clip, G_clip)
 
     with torch.no_grad():
-        u_new = u - eta_u * grad_u
+        u_raw = u - eta_u * grad_u
+        floor_active = (u_raw < log_L).to(log_L.dtype)
+        u_new = torch.maximum(u_raw, log_L)
         u_new = torch.clamp(u_new, min=u_min, max=u_max)
 
     return (
         u_new.detach(),
-        total_loss.detach(),
         res_loss.detach(),
-        floor_loss.detach(),
         target.detach(),
         log_L.detach(),
         floor_active.detach(),
@@ -431,15 +429,11 @@ def get_args():
     parser.add_argument('--task_lambda', type=float, default=1.0,
                         help='weight of task-awareness term in online_task_aware sigma mode')
 
-    # Lipschitz floor (online_convex_bal_lipschitz mode).
-    # NOTE: these knobs partially conflict with the tuning-free thesis. Defense:
-    # (i) they have robust defaults and shouldn't need per-case tuning (unlike
-    # sigma_0 which swings orders of magnitude), and (ii) lambda_L only controls
-    # the warmup speed, not the asymptotic rate -- any lambda_L > 0 eventually
-    # enforces sigma >= L_hat. Empirically verify this before claiming robustness.
-    parser.add_argument('--lambda_L', type=float, default=1.0,
-                        help='weight of one-sided quadratic Lipschitz floor in '
-                             'online_convex_bal_lipschitz sigma mode')
+    # Lipschitz floor for online_convex_bal_lipschitz mode.
+    # DESIGN NOTE (2026-04-19): hard projection is used (no lambda_L knob).
+    # Empirical finding: soft quadratic floor required lambda_L ~ 100 to
+    # converge on label=1, i.e. the data wanted the hard-projection limit.
+    # Hard projection is exactly that limit; it also simplifies the proof.
     parser.add_argument('--lipschitz_ema_beta', type=float, default=0.9,
                         help='EMA smoothing factor for BB-type Lipschitz estimate '
                              '(L_hat_ema = beta*L_hat_ema + (1-beta)*L_hat_raw)')
@@ -1454,7 +1448,6 @@ if __name__ == '__main__':
 
         # ---- State for online_convex_bal_lipschitz (BB Lipschitz floor) ----
         # Always initialized; only consumed when sigma_mode matches.
-        lambda_L = getattr(args, "lambda_L", 1.0)
         lipschitz_ema_beta = getattr(args, "lipschitz_ema_beta", 0.9)
         lipschitz_min_dz = getattr(args, "lipschitz_min_dz", 1e-6)
         lipschitz_max = getattr(args, "lipschitz_max", 1e8)
@@ -1617,8 +1610,6 @@ if __name__ == '__main__':
             ta_target = None
             ta_grad_u = None
             ta_loss_increase = None
-            lf_res_loss = None
-            lf_floor_loss = None
             lf_log_L = None
             lf_floor_active = None
             L_hat_tensor = None
@@ -1692,13 +1683,12 @@ if __name__ == '__main__':
                 elif sigma_mode == "online_convex_bal_lipschitz":
                     u = u_sigma.detach()
                     L_hat_arg = L_hat_tensor if L_hat_tensor is not None else torch.tensor(0.0, device=device)
-                    (u_new, sigma_loss, lf_res_loss, lf_floor_loss,
-                     sigma_target, lf_log_L, lf_floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
+                    (u_new, sigma_loss, sigma_target,
+                     lf_log_L, lf_floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
                         u=u,
                         primal_res=torch.tensor(avg_primal_res, device=device),
                         delta_y=torch.tensor(avg_delta_y, device=device),
                         L_hat=L_hat_arg,
-                        lambda_L=lambda_L,
                         eta_u=eta_u,
                         G_clip=G_clip,
                         u_min=math.log(sigma_min),
@@ -1783,8 +1773,6 @@ if __name__ == '__main__':
                 elif sigma_mode == "online_convex_bal_lipschitz":
                     if sigma_loss is not None:
                         log_dict["sigma/loss"] = sigma_loss.item()
-                        log_dict["sigma/res_loss"] = lf_res_loss.item()
-                        log_dict["sigma/floor_loss"] = lf_floor_loss.item()
                         log_dict["sigma/target"] = sigma_target.item()
                         log_dict["sigma/log_L_hat"] = lf_log_L.item()
                         log_dict["sigma/L_hat"] = float(torch.exp(lf_log_L).item())
