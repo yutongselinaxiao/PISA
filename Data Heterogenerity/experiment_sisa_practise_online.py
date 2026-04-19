@@ -101,6 +101,67 @@ def online_convex_bal_update_u(
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
 
 
+def online_convex_bal_lipschitz_update_u(
+    u,
+    primal_res,
+    delta_y,
+    L_hat,
+    lambda_L=1.0,
+    eta_u=0.05,
+    G_clip=10.0,
+    u_min=-20.0,
+    u_max=20.0,
+    eps=1e-12,
+):
+    """
+    Residual-balance online update on u = log(sigma) augmented with a
+    one-sided quadratic Lipschitz floor:
+
+        L(u) = 0.5 * (u - (log r - log dy))^2
+             + 0.5 * lambda_L * max(0, log(L_hat) - u)^2
+
+    The floor term activates only when sigma < L_hat (observed local
+    Lipschitz of the global gradient), forcing sigma above the
+    linearized-ADMM instability threshold. Inactive when sigma >= L_hat,
+    reducing to plain residual balance.
+    """
+    r_clip = torch.clamp(primal_res, min=eps)
+    dy_clip = torch.clamp(delta_y, min=eps)
+    L_clip = torch.clamp(L_hat, min=eps)
+
+    target = torch.log(r_clip) - torch.log(dy_clip)
+    log_L = torch.log(L_clip)
+
+    diff = u - target
+    res_loss = diff.pow(2)
+    grad_res = 2.0 * diff
+
+    gap = log_L - u
+    gap_pos = gap.clamp(min=0.0)
+    floor_active = (gap > 0).to(gap.dtype)
+    floor_loss = 0.5 * lambda_L * gap_pos.pow(2)
+    grad_floor = -lambda_L * gap_pos  # d/du of 0.5*lambda*(log_L - u)^2_+
+
+    total_loss = res_loss + floor_loss
+    grad_u = grad_res + grad_floor
+    grad_u = torch.clamp(grad_u, -G_clip, G_clip)
+
+    with torch.no_grad():
+        u_new = u - eta_u * grad_u
+        u_new = torch.clamp(u_new, min=u_min, max=u_max)
+
+    return (
+        u_new.detach(),
+        total_loss.detach(),
+        res_loss.detach(),
+        floor_loss.detach(),
+        target.detach(),
+        log_L.detach(),
+        floor_active.detach(),
+        grad_u.detach(),
+    )
+
+
 def online_task_aware_update_u(
     u,
     primal_res,
@@ -347,7 +408,8 @@ def get_args():
 
     # adaptive rho mode
     parser.add_argument('--sigma_mode', type=str, default='fixed',
-                    choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal', 'online_task_aware'],
+                    choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal',
+                             'online_convex_bal_lipschitz', 'online_task_aware'],
                     help='sigma update mode for sisa')
 
     parser.add_argument('--sigma_min', type=float, default=1e-6,
@@ -368,6 +430,24 @@ def get_args():
                         help='gradient clipping threshold for u update')
     parser.add_argument('--task_lambda', type=float, default=1.0,
                         help='weight of task-awareness term in online_task_aware sigma mode')
+
+    # Lipschitz floor (online_convex_bal_lipschitz mode).
+    # NOTE: these knobs partially conflict with the tuning-free thesis. Defense:
+    # (i) they have robust defaults and shouldn't need per-case tuning (unlike
+    # sigma_0 which swings orders of magnitude), and (ii) lambda_L only controls
+    # the warmup speed, not the asymptotic rate -- any lambda_L > 0 eventually
+    # enforces sigma >= L_hat. Empirically verify this before claiming robustness.
+    parser.add_argument('--lambda_L', type=float, default=1.0,
+                        help='weight of one-sided quadratic Lipschitz floor in '
+                             'online_convex_bal_lipschitz sigma mode')
+    parser.add_argument('--lipschitz_ema_beta', type=float, default=0.9,
+                        help='EMA smoothing factor for BB-type Lipschitz estimate '
+                             '(L_hat_ema = beta*L_hat_ema + (1-beta)*L_hat_raw)')
+    parser.add_argument('--lipschitz_min_dz', type=float, default=1e-6,
+                        help='minimum ||z^k - z^{k-1}|| to update Lipschitz estimate; '
+                             'smaller deltas are skipped to avoid noise amplification')
+    parser.add_argument('--lipschitz_max', type=float, default=1e8,
+                        help='clip for the raw BB Lipschitz estimate per round')
 
     # numerical stability
     parser.add_argument('--eps', type=float, default=1e-8,
@@ -1372,6 +1452,16 @@ if __name__ == '__main__':
         criterion = nn.CrossEntropyLoss().to(device)
         test_record = []
 
+        # ---- State for online_convex_bal_lipschitz (BB Lipschitz floor) ----
+        # Always initialized; only consumed when sigma_mode matches.
+        lambda_L = getattr(args, "lambda_L", 1.0)
+        lipschitz_ema_beta = getattr(args, "lipschitz_ema_beta", 0.9)
+        lipschitz_min_dz = getattr(args, "lipschitz_min_dz", 1e-6)
+        lipschitz_max = getattr(args, "lipschitz_max", 1e8)
+        grad_global_prev = None  # sum_i alpha_i * grad F_i(z^{k-1})
+        z_prev_bb = [w.clone().detach() for w in W_global]  # z^{k-1}
+        L_hat_ema = torch.tensor(0.0, device=device)
+
         for epoch in range(args.comm_round):
             epoch_train_correct = 0
             epoch_train_total = 0
@@ -1388,6 +1478,11 @@ if __name__ == '__main__':
             epoch_primal_res = []
             epoch_dual_res = []
             epoch_delta_y = []
+
+            # Snapshot z^k for BB Lipschitz estimate before any modification this round
+            z_curr_bb = [w.clone().detach() for w in W_global]
+            # alpha-weighted accumulated gradient across clients at z^k, lazy-init below
+            grad_global_curr = None
 
             for sb in range(args.n_parties):
                 dataidxs = net_dataidx_map[sb]
@@ -1442,6 +1537,20 @@ if __name__ == '__main__':
                         loss.backward()
 
                 gradients = [param.grad for param in model.parameters()]
+
+                # BB Lipschitz: accumulate alpha-weighted per-client gradient at z^k.
+                # NOTE: raw-sum gradient (no 1/num_batches scaling) -- only the
+                # *ratio* ||dg||/||dz|| matters for BB, and scaling is consistent
+                # across rounds as long as the dataloader pass is identical.
+                if sigma_mode == "online_convex_bal_lipschitz":
+                    if grad_global_curr is None:
+                        grad_global_curr = [
+                            torch.zeros_like(g) if g is not None else None for g in gradients
+                        ]
+                    with torch.no_grad():
+                        for j, g in enumerate(gradients):
+                            if g is not None and grad_global_curr[j] is not None:
+                                grad_global_curr[j].add_(alpha_b[sb] * g.detach())
 
                 with torch.no_grad():
                     current_sigma = sigma_lr
@@ -1508,6 +1617,34 @@ if __name__ == '__main__':
             ta_target = None
             ta_grad_u = None
             ta_loss_increase = None
+            lf_res_loss = None
+            lf_floor_loss = None
+            lf_log_L = None
+            lf_floor_active = None
+            L_hat_tensor = None
+
+            # BB Lipschitz update: needs previous round's grad and z, so only fires from epoch 1.
+            if sigma_mode == "online_convex_bal_lipschitz" and grad_global_curr is not None:
+                with torch.no_grad():
+                    if grad_global_prev is not None:
+                        dz_tensors = [a - b for a, b in zip(z_curr_bb, z_prev_bb)]
+                        dz_norm = global_norm(dz_tensors)
+                        if dz_norm.item() >= lipschitz_min_dz:
+                            dg_tensors = []
+                            for a, b in zip(grad_global_curr, grad_global_prev):
+                                if a is None and b is None:
+                                    continue
+                                if a is None:
+                                    dg_tensors.append(-b.detach())
+                                elif b is None:
+                                    dg_tensors.append(a.detach())
+                                else:
+                                    dg_tensors.append(a.detach() - b.detach())
+                            dg_norm = global_norm(dg_tensors)
+                            L_hat_raw = torch.clamp(dg_norm / dz_norm, max=lipschitz_max)
+                            L_hat_ema = (lipschitz_ema_beta * L_hat_ema
+                                         + (1.0 - lipschitz_ema_beta) * L_hat_raw)
+                    L_hat_tensor = L_hat_ema.clone()
 
             # if epoch % 10 == 0 and 0 < epoch:
             if epoch % 1 == 0 and 0 < epoch:
@@ -1544,6 +1681,25 @@ if __name__ == '__main__':
                         delta_y=torch.tensor(avg_delta_y, device=device),
                         # eta_u=eta_u/(epoch+1),  # decay learning rate over epochs
                         eta_u=eta_u,  # changed to fixed eta_u on April 16th
+                        G_clip=G_clip,
+                        u_min=math.log(sigma_min),
+                        u_max=math.log(sigma_max),
+                        eps=getattr(args, "eps", 1e-12),
+                    )
+                    u_sigma = u_new
+                    sigma_lr = float(torch.exp(u_new).item())
+
+                elif sigma_mode == "online_convex_bal_lipschitz":
+                    u = u_sigma.detach()
+                    L_hat_arg = L_hat_tensor if L_hat_tensor is not None else torch.tensor(0.0, device=device)
+                    (u_new, sigma_loss, lf_res_loss, lf_floor_loss,
+                     sigma_target, lf_log_L, lf_floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
+                        u=u,
+                        primal_res=torch.tensor(avg_primal_res, device=device),
+                        delta_y=torch.tensor(avg_delta_y, device=device),
+                        L_hat=L_hat_arg,
+                        lambda_L=lambda_L,
+                        eta_u=eta_u,
                         G_clip=G_clip,
                         u_min=math.log(sigma_min),
                         u_max=math.log(sigma_max),
@@ -1624,7 +1780,25 @@ if __name__ == '__main__':
                     log_dict["sigma/grad_u"] = ta_grad_u.item()
                     log_dict["sigma/loss_increase"] = ta_loss_increase
 
+                elif sigma_mode == "online_convex_bal_lipschitz":
+                    if sigma_loss is not None:
+                        log_dict["sigma/loss"] = sigma_loss.item()
+                        log_dict["sigma/res_loss"] = lf_res_loss.item()
+                        log_dict["sigma/floor_loss"] = lf_floor_loss.item()
+                        log_dict["sigma/target"] = sigma_target.item()
+                        log_dict["sigma/log_L_hat"] = lf_log_L.item()
+                        log_dict["sigma/L_hat"] = float(torch.exp(lf_log_L).item())
+                        log_dict["sigma/floor_active"] = lf_floor_active.item()
+                        log_dict["sigma/grad_u"] = grad_u.item()
+                    if L_hat_tensor is not None:
+                        log_dict["sigma/L_hat_ema"] = float(L_hat_tensor.item())
+
                 wandb.log(log_dict, step=epoch)
+
+            # Rotate BB state: current round's grad/z become previous for next round
+            if sigma_mode == "online_convex_bal_lipschitz":
+                grad_global_prev = grad_global_curr
+                z_prev_bb = z_curr_bb
 
         print('######################################################')
         print('The highest test accuracy is:', max(test_record))
