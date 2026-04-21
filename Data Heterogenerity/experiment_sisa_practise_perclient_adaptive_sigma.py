@@ -1549,6 +1549,12 @@ if __name__ == '__main__':
         L_hat_tv_prev_per_client = [0.0 for _ in range(args.n_parties)]
         L_hat_raw_tv_prev_per_client = [None for _ in range(args.n_parties)]
 
+        # Counter for sigma-update events (increments once per fire, independent
+        # of sigma_update_freq). Used as `k` in decay schedules so the textbook
+        # strongly-convex step 1/(mu*k) counts actual OGD steps, not epochs.
+        # Without this, freq=10 gets ~14x smaller descent budget than freq=1.
+        sigma_update_step = 0
+
         for epoch in range(args.comm_round):
             epoch_train_correct = 0
             epoch_train_total = 0
@@ -1779,8 +1785,12 @@ if __name__ == '__main__':
                         else:
                             L_hat_tensor_per_client[sb] = torch.tensor(0.0, device=device)
 
-            if epoch % 10 == 0 and 0 < epoch:
-                if sigma_mode == "heuristic" and ((epoch + 1) % sigma_update_freq == 0):
+            # Single sigma-update gate driven solely by --sigma_update_freq.
+            # (Previously an outer `epoch % 10 == 0` hardcode overrode freq;
+            # removed so freq=1 fires every epoch and freq=10 fires every 10.)
+            if epoch > 0 and ((epoch + 1) % sigma_update_freq == 0):
+                sigma_update_step += 1
+                if sigma_mode == "heuristic":
                     for sb in range(args.n_parties):
                         sigma_new = heuristic_update_sigma(
                             sigma_b[sb],
@@ -1791,7 +1801,7 @@ if __name__ == '__main__':
                         )
                         sigma_b[sb] = float(max(sigma_min, min(sigma_max, sigma_new)))
 
-                elif sigma_mode == "online_balance" and ((epoch + 1) % sigma_update_freq == 0):
+                elif sigma_mode == "online_balance":
                     for sb in range(args.n_parties):
                         old_u = u_sigma_b[sb].detach()
                         u = old_u.clone().requires_grad_(True)
@@ -1800,7 +1810,7 @@ if __name__ == '__main__':
                             u,
                             torch.tensor(epoch_primal_res[sb], device=device),
                             torch.tensor(epoch_dual_res[sb], device=device),
-                            eta_u=eta_u / (epoch + 1),
+                            eta_u=eta_u / sigma_update_step,
                             G_clip=G_clip,
                             u_min=math.log(sigma_min),
                             u_max=math.log(sigma_max),
@@ -1817,7 +1827,7 @@ if __name__ == '__main__':
                         sigma_b[sb] = float(torch.exp(u_sigma_b[sb]).item())
                         sigma_loss_list.append(sigma_loss.item())
 
-                elif sigma_mode == "online_convex_bal" and ((epoch + 1) % sigma_update_freq == 0):
+                elif sigma_mode == "online_convex_bal":
                     for sb in range(args.n_parties):
                         old_u = u_sigma_b[sb].detach()
 
@@ -1896,7 +1906,7 @@ if __name__ == '__main__':
                         sigma_loss_list.append(float(sigma_loss.item()))
                         sigma_target_list.append(float(sigma_target.item()))
                         sigma_grad_u_list.append(float(grad_u.item()))
-                elif sigma_mode == "online_convex_bal_debug" and ((epoch + 1) % sigma_update_freq == 0):
+                elif sigma_mode == "online_convex_bal_debug":
                     for sb in range(args.n_parties):    
                         old_u = u_sigma_b[sb].detach()
                         eps_val = getattr(args, "eps", 1e-12)
@@ -1930,14 +1940,17 @@ if __name__ == '__main__':
                 elif sigma_mode in (
                     "online_convex_bal_lipschitz_oldres",
                     "online_convex_bal_lipschitz_newres",
-                ) and ((epoch + 1) % sigma_update_freq == 0):
+                ):
                     # textbook_sc uses mu = 2 (loss (u-tau)^2 is 2-strongly-convex).
+                    # Indexed by sigma_update_step (not epoch) so freq > 1 keeps
+                    # the full G_clip/mu * ln(K) descent budget.
+                    k_sigma = sigma_update_step
                     if eta_u_decay == "inverse":
-                        eta_u_eff = eta_u / (epoch + 1)
+                        eta_u_eff = eta_u / k_sigma
                     elif eta_u_decay == "inv_sqrt":
-                        eta_u_eff = eta_u / math.sqrt(epoch + 1)
+                        eta_u_eff = eta_u / math.sqrt(k_sigma)
                     elif eta_u_decay == "textbook_sc":
-                        eta_u_eff = 1.0 / (2.0 * (epoch + 1))
+                        eta_u_eff = 1.0 / (2.0 * k_sigma)
                     else:
                         eta_u_eff = eta_u
 
@@ -1980,7 +1993,7 @@ if __name__ == '__main__':
                         sigma_grad_u_list.append(float(grad_u.item()))
                         log_L_hat_list[sb] = float(lf_log_L.item())
                         floor_active_list[sb] = float(lf_floor_active.item())
-                elif sigma_mode == "online_hybrid" and ((epoch + 1) % sigma_update_freq == 0):
+                elif sigma_mode == "online_hybrid":
                     for sb in range(args.n_parties):
                         old_u = u_sigma_b[sb].detach()
 

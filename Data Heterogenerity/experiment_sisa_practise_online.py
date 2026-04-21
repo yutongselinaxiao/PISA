@@ -1499,6 +1499,13 @@ if __name__ == '__main__':
         param_names_bb = [n for n, _ in model.named_parameters()]
         L_hat_ema_per_layer = [0.0] * len(param_names_bb)
 
+        # Counter for sigma-update events (increments once per fire, independent
+        # of sigma_update_freq). Used as `k` in decay schedules so the textbook
+        # strongly-convex step 1/(mu*k) reflects the number of OGD steps taken,
+        # not the epoch index -- otherwise freq=10 gets a 14x smaller descent
+        # budget than freq=1 and fails to descend from large sigma_0.
+        sigma_update_step = 0
+
         # ---- Total-variation accumulators (path-length proxy).
         # Validates the bounded-variation theorem in
         # notes/lipschitz_floor_bounded_variation.tex: check whether
@@ -1750,6 +1757,7 @@ if __name__ == '__main__':
             sigma_update_freq = getattr(args, "sigma_update_freq", 1)
             if epoch > 0 and ((epoch + 1) % sigma_update_freq == 0):
                 # update global sigma once per sigma_update_freq epochs
+                sigma_update_step += 1
                 if sigma_mode == "heuristic":
                     sigma_new = heuristic_update_sigma(
                         sigma_lr,
@@ -1797,14 +1805,17 @@ if __name__ == '__main__':
                     # in u. `inverse` and `inv_sqrt` scale the user-supplied eta_u.
                     # `textbook_sc` uses the parameter-free strongly-convex OGD step
                     # 1/(mu*k) with mu=2 -- ignores eta_u. Budget analysis: total
-                    # log-sigma descent over T rounds ~ G_clip/mu * ln T, which
-                    # covers a wide sigma_0 range without a tunable eta_u.
+                    # log-sigma descent over K update events ~ G_clip/mu * ln K,
+                    # which covers a wide sigma_0 range without a tunable eta_u.
+                    # `k` is the sigma-update event counter (not the epoch index),
+                    # so budget is preserved under sigma_update_freq > 1.
+                    k_sigma = sigma_update_step
                     if eta_u_decay == "inverse":
-                        eta_u_eff = eta_u / (epoch + 1)
+                        eta_u_eff = eta_u / k_sigma
                     elif eta_u_decay == "inv_sqrt":
-                        eta_u_eff = eta_u / math.sqrt(epoch + 1)
+                        eta_u_eff = eta_u / math.sqrt(k_sigma)
                     elif eta_u_decay == "textbook_sc":
-                        eta_u_eff = 1.0 / (2.0 * (epoch + 1))
+                        eta_u_eff = 1.0 / (2.0 * k_sigma)
                     else:
                         eta_u_eff = eta_u
                     (u_new, sigma_loss, sigma_target,
@@ -1918,6 +1929,7 @@ if __name__ == '__main__':
                     log_dict["sigma/L_hat_buffer_size"] = len(L_hat_buffer)
                     if eta_u_eff is not None:
                         log_dict["sigma/eta_u_eff"] = float(eta_u_eff)
+                    log_dict["sigma/update_step"] = sigma_update_step
 
                     # Per-layer L̂ diagnostic: summary stats + per-group details.
                     # max/median >= ~22x suggests per-layer sigma is worth pursuing.
