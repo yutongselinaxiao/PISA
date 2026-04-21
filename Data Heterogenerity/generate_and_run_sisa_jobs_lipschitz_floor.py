@@ -15,8 +15,11 @@ Pilot history:
   project_lipschitz_estimator_ema_chosen.md.
 - 2026-04-19 (current): decay schedule pilot. Previous runs showed sigma limit
   cycles (esp. fmnist) due to constant eta_u fighting the Lipschitz projection.
-  Compare eta_u_decay in {none, inverse} (latter = 1/(k+1), textbook rate for
-  strongly-convex OGD on the (u - tau)^2 loss -- not a new tunable).
+  First try was eta_u_decay=inverse (eta_u/(k+1)) but it failed at sigma_0=1e4
+  due to insufficient descent budget. Current sweep: {none, textbook_sc} where
+  textbook_sc = 1/(mu*k) with mu=2 (strong-convexity of (u-tau)^2) -- this
+  ignores --eta_u entirely and is parameter-free. See memory
+  project_eta_u_textbook_sc_step.md.
 """
 
 import stat
@@ -36,10 +39,19 @@ SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
 ESTIMATOR = "ema"
 LIPSCHITZ_WINDOW_SIZE = "20"
 
-# Decay schedule for eta_u. Textbook OGD: constant vs 1/(k+1) (strongly-convex rate).
-# Both are "no new knob" choices covered by regret-bound theory.
-ETA_U_DECAYS = ["none", "inverse"]
-# ETA_U_DECAYS = ["none", "inverse"]
+# Decay schedule for eta_u.
+# - "none" = constant eta_u (baseline we're trying to beat; oscillates late).
+# - "inverse" = eta_u / (k+1). KNOWN TO FAIL at sigma_0 = 1e4 because the
+#   total descent budget eta_u * G_clip * ln(T) ~ 1.55 in log-space is smaller
+#   than log(sigma_0 / sigma*) ~ 1.6 needed to descend from 1e4. Dropped.
+# - "textbook_sc" = 1/(mu*k) with mu=2; parameter-free. Budget = G_clip/mu * ln T
+#   ~ 15.5 in log-space, easily covers any sigma_0 in [sigma_min, sigma_max].
+#
+# 2026-04-19: "none" baseline already covered by the prior estimator-pilot runs
+# in the "paper-lipschitz-estimator" project, so we only launch textbook_sc
+# here. Old two-entry sweep kept below for reference.
+# ETA_U_DECAYS = ["none", "textbook_sc"]
+ETA_U_DECAYS = ["textbook_sc"]
 
 ONLINE_ENTRY = "experiment_sisa_practise_online.py"
 

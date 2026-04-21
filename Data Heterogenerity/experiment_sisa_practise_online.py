@@ -425,11 +425,13 @@ def get_args():
     parser.add_argument('--eta_u', type=float, default=0.05,
                         help='step size for online OGD update of u=log(sigma)')
     parser.add_argument('--eta_u_decay', type=str, default='none',
-                        choices=['none', 'inverse', 'inv_sqrt'],
+                        choices=['none', 'inverse', 'inv_sqrt', 'textbook_sc'],
                         help='diminishing step-size schedule for OGD update of '
                              'u=log(sigma). none (default) = constant eta_u. '
                              'inverse = eta_u/(k+1), the strongly-convex OGD rate. '
                              'inv_sqrt = eta_u/sqrt(k+1), the general OGD rate. '
+                             'textbook_sc = 1/(mu*k) with mu=2 (strong-convexity of '
+                             '(u-tau)^2); parameter-free, IGNORES --eta_u. '
                              'k is the communication round.')
     parser.add_argument('--G_clip', type=float, default=10.0,
                         help='gradient clipping threshold for u update')
@@ -1725,12 +1727,17 @@ if __name__ == '__main__':
                     u = u_sigma.detach()
                     L_hat_arg = L_hat_tensor if L_hat_tensor is not None else torch.tensor(0.0, device=device)
                     # Diminishing step-size schedule. (u-tau)^2 is 2-strongly-convex
-                    # in u, so the textbook rate for strongly-convex OGD is 1/(k+1);
-                    # inv_sqrt is the general rate. k = communication round.
+                    # in u. `inverse` and `inv_sqrt` scale the user-supplied eta_u.
+                    # `textbook_sc` uses the parameter-free strongly-convex OGD step
+                    # 1/(mu*k) with mu=2 -- ignores eta_u. Budget analysis: total
+                    # log-sigma descent over T rounds ~ G_clip/mu * ln T, which
+                    # covers a wide sigma_0 range without a tunable eta_u.
                     if eta_u_decay == "inverse":
                         eta_u_eff = eta_u / (epoch + 1)
                     elif eta_u_decay == "inv_sqrt":
                         eta_u_eff = eta_u / math.sqrt(epoch + 1)
+                    elif eta_u_decay == "textbook_sc":
+                        eta_u_eff = 1.0 / (2.0 * (epoch + 1))
                     else:
                         eta_u_eff = eta_u
                     (u_new, sigma_loss, sigma_target,
