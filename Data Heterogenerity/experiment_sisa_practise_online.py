@@ -1,3 +1,14 @@
+"""Shared-sigma SISA trainer (single global u = log sigma).
+
+Change log (most recent first):
+
+- 2026-04-20: Added `--sigma_update_freq` (int, default 1). The sigma-update
+  dispatch gate changed from `if epoch % 1 == 0 and 0 < epoch` to
+  `if epoch > 0 and ((epoch + 1) % sigma_update_freq == 0)`, so sigma is
+  refreshed once every N eligible epochs. Default 1 preserves the previous
+  every-epoch behavior; use 10 to match per_client.py's built-in cadence.
+"""
+
 import numpy as np
 import json
 import torch
@@ -424,6 +435,10 @@ def get_args():
     # online OGD update on u = log(rho)
     parser.add_argument('--eta_u', type=float, default=0.05,
                         help='step size for online OGD update of u=log(sigma)')
+    parser.add_argument('--sigma_update_freq', type=int, default=1,
+                        help='update sigma once every this many eligible epochs '
+                             '(default 1 = every epoch after the first). '
+                             'Use 10 to match the per_client.py cadence.')
     parser.add_argument('--eta_u_decay', type=str, default='none',
                         choices=['none', 'inverse', 'inv_sqrt', 'textbook_sc'],
                         help='diminishing step-size schedule for OGD update of '
@@ -1477,6 +1492,19 @@ if __name__ == '__main__':
         L_hat_ema = torch.tensor(0.0, device=device)
         L_hat_buffer = []  # ring buffer of raw L_hat samples, for running_min/median
 
+        # ---- Total-variation accumulators (path-length proxy).
+        # Validates the bounded-variation theorem in
+        # notes/lipschitz_floor_bounded_variation.tex: check whether
+        # TV(sigma), TV(L_hat) grow sublinearly in T.
+        TV_sigma = 0.0
+        TV_log_sigma = 0.0
+        TV_L_hat = 0.0
+        TV_L_hat_raw = 0.0
+        sigma_tv_prev = sigma_lr
+        log_sigma_tv_prev = math.log(max(sigma_lr, 1e-12))
+        L_hat_tv_prev = float(L_hat_ema.item())
+        L_hat_raw_tv_prev = None
+
         for epoch in range(args.comm_round):
             epoch_train_correct = 0
             epoch_train_total = 0
@@ -1656,9 +1684,17 @@ if __name__ == '__main__':
                                     dg_tensors.append(a.detach() - b.detach())
                             dg_norm = global_norm(dg_tensors)
                             L_hat_raw = torch.clamp(dg_norm / dz_norm, max=lipschitz_max)
+                            # TV accumulators: raw-BB and EMA-smoothed.
+                            L_hat_raw_val = float(L_hat_raw.item())
+                            if L_hat_raw_tv_prev is not None:
+                                TV_L_hat_raw += abs(L_hat_raw_val - L_hat_raw_tv_prev)
+                            L_hat_raw_tv_prev = L_hat_raw_val
                             # Always update EMA state (cheap; used when estimator=ema).
                             L_hat_ema = (lipschitz_ema_beta * L_hat_ema
                                          + (1.0 - lipschitz_ema_beta) * L_hat_raw)
+                            L_hat_ema_val = float(L_hat_ema.item())
+                            TV_L_hat += abs(L_hat_ema_val - L_hat_tv_prev)
+                            L_hat_tv_prev = L_hat_ema_val
                             # Always update the ring buffer (used by running_min/median).
                             L_hat_buffer.append(float(L_hat_raw.item()))
                             if len(L_hat_buffer) > lipschitz_window_size:
@@ -1680,9 +1716,9 @@ if __name__ == '__main__':
                     else:
                         L_hat_tensor = torch.tensor(0.0, device=device)
 
-            # if epoch % 10 == 0 and 0 < epoch:
-            if epoch % 1 == 0 and 0 < epoch:
-                # update global sigma once per epoch
+            sigma_update_freq = getattr(args, "sigma_update_freq", 1)
+            if epoch > 0 and ((epoch + 1) % sigma_update_freq == 0):
+                # update global sigma once per sigma_update_freq epochs
                 if sigma_mode == "heuristic":
                     sigma_new = heuristic_update_sigma(
                         sigma_lr,
@@ -1792,6 +1828,13 @@ if __name__ == '__main__':
             test_record.append(test_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
+            # Accumulate sigma path length at epoch boundary.
+            log_sigma_now = math.log(max(sigma_lr, 1e-12))
+            TV_sigma += abs(sigma_lr - sigma_tv_prev)
+            TV_log_sigma += abs(log_sigma_now - log_sigma_tv_prev)
+            sigma_tv_prev = sigma_lr
+            log_sigma_tv_prev = log_sigma_now
+
             if getattr(args, "use_wandb", False):
                 log_dict = {
                     "train/acc": train_acc,
@@ -1804,6 +1847,10 @@ if __name__ == '__main__':
                     "dual_res/avg": avg_dual_res,
                     "delta_y/avg": avg_delta_y,
                     "rho_fixed": rho_lr,
+                    "sigma/TV": TV_sigma,
+                    "sigma/log_TV": TV_log_sigma,
+                    "L_hat/TV": TV_L_hat,
+                    "L_hat_raw/TV": TV_L_hat_raw,
                 }
 
                 for i in range(args.n_parties):

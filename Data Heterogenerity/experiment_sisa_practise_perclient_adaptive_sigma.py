@@ -1,3 +1,24 @@
+"""Per-client adaptive-sigma SISA trainer.
+
+Change log (most recent first):
+
+- 2026-04-20: Ported online.py's hard Lipschitz floor into two new per-client
+  sigma_modes that differ in how the dual-side signal is computed:
+    * online_convex_bal_lipschitz_oldres -- delta_y = ||W_global - W_global_prev||
+      (the global step, shared across clients in an epoch).
+    * online_convex_bal_lipschitz_newres -- delta_y = ||W_n - W_n_prev||
+      (per-client iterate change, matches the current default definition).
+  Both modes share one update function `online_convex_bal_lipschitz_update_u`
+  (loss = (u - tau)^2, grad = 2*(u - tau), 2-strongly convex in u) -- this is
+  the version that works in online.py. Each client keeps its own EMA-smoothed
+  BB Lipschitz estimate L_hat_i and projects u_i >= log L_hat_i.
+  New CLI flags: --eta_u_decay, --lipschitz_estimator,
+  --lipschitz_window_size, --lipschitz_ema_beta, --lipschitz_min_dz,
+  --lipschitz_max. Also fixed a typo in `--sigma_mode` choices
+  (`online_convex_bal_denug` -> `online_convex_bal_debug`) so the existing
+  debug branch becomes reachable.
+"""
+
 import numpy as np
 import json
 import torch
@@ -191,6 +212,61 @@ def online_convex_bal_update_u(
 
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
 
+
+def online_convex_bal_lipschitz_update_u(
+    u,
+    primal_res,
+    delta_y,
+    L_hat,
+    eta_u=0.05,
+    G_clip=10.0,
+    u_min=-20.0,
+    u_max=20.0,
+    eps=1e-12,
+):
+    """
+    Residual-balance online update on u = log(sigma) with a HARD Lipschitz
+    projection enforcing sigma >= L_hat. Ported verbatim from online.py:
+
+        loss    = (u - tau)^2              (2-strongly-convex in u; mu = 2)
+        grad_u  = 2 * (u - tau)
+        u_raw   = u - eta_u * clamp(grad_u, -G_clip, G_clip)
+        u_new   = clamp(max(u_raw, log L_hat), u_min, u_max)
+
+    Paired with eta_u_decay='textbook_sc' this uses eta_u_eff = 1/(2 * k).
+
+    The "old residual" vs "new residual" axis lives one level up: the *caller*
+    decides what delta_y to feed in (global ||W_global - W_global_prev|| vs
+    per-client ||W_n - W_n_prev||).
+    """
+    r_clip = torch.clamp(primal_res, min=eps)
+    dy_clip = torch.clamp(delta_y, min=eps)
+    L_clip = torch.clamp(L_hat, min=eps)
+
+    target = torch.log(r_clip) - torch.log(dy_clip)
+    log_L = torch.log(L_clip)
+
+    diff = u - target
+    res_loss = diff.pow(2)
+    grad_u = 2.0 * diff
+    grad_u = torch.clamp(grad_u, -G_clip, G_clip)
+
+    with torch.no_grad():
+        u_raw = u - eta_u * grad_u
+        floor_active = (u_raw < log_L).to(log_L.dtype)
+        u_new = torch.maximum(u_raw, log_L)
+        u_new = torch.clamp(u_new, min=u_min, max=u_max)
+
+    return (
+        u_new.detach(),
+        res_loss.detach(),
+        target.detach(),
+        log_L.detach(),
+        floor_active.detach(),
+        grad_u.detach(),
+    )
+
+
 import math
 import torch
 
@@ -337,8 +413,19 @@ def get_args():
 
     # adaptive sigma mode
     parser.add_argument('--sigma_mode', type=str, default='fixed',
-                        choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal', 'online_convex_bal_denug', 'online_hybrid'],
-                        help='sigma update mode for sisa')
+                        choices=['fixed', 'heuristic', 'online_balance',
+                                 'online_convex_bal', 'online_convex_bal_debug',
+                                 'online_convex_bal_lipschitz_oldres',
+                                 'online_convex_bal_lipschitz_newres',
+                                 'online_hybrid'],
+                        help='sigma update mode for sisa. The two lipschitz '
+                             'variants apply a per-client hard projection u >= '
+                             'log(L_hat_i) on top of online.py\'s convex-bal '
+                             'update; they differ in how delta_y is computed: '
+                             'oldres uses the global step ||W_global - '
+                             'W_global_prev|| (shared across clients), newres '
+                             'uses the per-client iterate change ||W_n - '
+                             'W_n_prev|| (current residual definition).')
 
     parser.add_argument('--sigma_min', type=float, default=1e-6,
                         help='minimum allowed sigma')
@@ -354,10 +441,33 @@ def get_args():
     # online update on u = log(sigma)
     parser.add_argument('--eta_u', type=float, default=0.05,
                         help='step size for online update of u = log(sigma)')
+    parser.add_argument('--eta_u_decay', type=str, default='none',
+                        choices=['none', 'inverse', 'inv_sqrt', 'textbook_sc'],
+                        help='diminishing step-size schedule for the OGD update '
+                             'of u = log(sigma). none = constant eta_u. '
+                             'inverse = eta_u/(k+1). inv_sqrt = eta_u/sqrt(k+1). '
+                             'textbook_sc = 1/(mu*k) with mu=2 (loss (u-tau)^2); '
+                             'parameter-free, IGNORES --eta_u.')
     parser.add_argument('--G_clip', type=float, default=10.0,
                         help='gradient clipping threshold for u update')
     parser.add_argument('--sigma_update_freq', type=int, default=1,
                         help='update sigma every this many eligible rounds')
+
+    # Lipschitz floor for online_convex_bal_lipschitz_{oldres,newres} modes.
+    # Estimator is PER-CLIENT: each client maintains its own BB-type L_hat_i
+    # from its own ||grad_i(z^k) - grad_i(z^{k-1})|| / ||z^k - z^{k-1}||.
+    parser.add_argument('--lipschitz_estimator', type=str, default='ema',
+                        choices=['ema', 'running_min', 'running_median'],
+                        help='smoothing rule for BB-type Lipschitz estimate.')
+    parser.add_argument('--lipschitz_window_size', type=int, default=20,
+                        help='window size for running_min/running_median.')
+    parser.add_argument('--lipschitz_ema_beta', type=float, default=0.9,
+                        help='EMA smoothing factor for per-client L_hat.')
+    parser.add_argument('--lipschitz_min_dz', type=float, default=1e-6,
+                        help='minimum ||z^k - z^{k-1}|| to update L_hat '
+                             '(smaller deltas are skipped to avoid noise).')
+    parser.add_argument('--lipschitz_max', type=float, default=1e8,
+                        help='clip for the raw per-client L_hat_raw per round.')
 
     # trust-region / stabilization for adaptive sigma
     parser.add_argument('--sigma_max_delta', type=float, default=0.2,
@@ -1410,6 +1520,35 @@ if __name__ == '__main__':
         primal_res_ema = [None for _ in range(args.n_parties)]
         delta_y_ema = [None for _ in range(args.n_parties)]
 
+        # ---- Per-client BB Lipschitz state for the _lipschitz_{oldres,newres}
+        # modes. Each client keeps its own gradient snapshot at z^{k-1} and its
+        # own L_hat estimator; the z reference is shared (W_global).
+        lipschitz_estimator = getattr(args, "lipschitz_estimator", "ema")
+        lipschitz_window_size = getattr(args, "lipschitz_window_size", 20)
+        lipschitz_ema_beta = getattr(args, "lipschitz_ema_beta", 0.9)
+        lipschitz_min_dz = getattr(args, "lipschitz_min_dz", 1e-6)
+        lipschitz_max_val = getattr(args, "lipschitz_max", 1e8)
+        eta_u_decay = getattr(args, "eta_u_decay", "none")
+        grad_prev_per_client = [None for _ in range(args.n_parties)]
+        L_hat_ema_per_client = [torch.tensor(0.0, device=device) for _ in range(args.n_parties)]
+        L_hat_buffer_per_client = [[] for _ in range(args.n_parties)]
+        z_prev_bb = [w.clone().detach() for w in W_global]
+
+        # ---- Per-client total-variation accumulators (path-length proxy).
+        # Validates the bounded-variation theorem in
+        # notes/lipschitz_floor_bounded_variation.tex. Per-client sigma, so
+        # per-client TV.
+        TV_sigma_per_client = [0.0 for _ in range(args.n_parties)]
+        TV_log_sigma_per_client = [0.0 for _ in range(args.n_parties)]
+        TV_L_hat_per_client = [0.0 for _ in range(args.n_parties)]
+        TV_L_hat_raw_per_client = [0.0 for _ in range(args.n_parties)]
+        sigma_tv_prev_per_client = [float(sigma_b[i]) for i in range(args.n_parties)]
+        log_sigma_tv_prev_per_client = [
+            math.log(max(float(sigma_b[i]), 1e-12)) for i in range(args.n_parties)
+        ]
+        L_hat_tv_prev_per_client = [0.0 for _ in range(args.n_parties)]
+        L_hat_raw_tv_prev_per_client = [None for _ in range(args.n_parties)]
+
         for epoch in range(args.comm_round):
             epoch_train_correct = 0
             epoch_train_total = 0
@@ -1424,6 +1563,18 @@ if __name__ == '__main__':
             epoch_primal_res = []
             epoch_dual_res = []
             epoch_delta_y = []
+            # Separate per-client and global dual bases for the _lipschitz_
+            # {oldres,newres} split. Old residual uses the global step (shared
+            # across all clients in an epoch); new residual uses per-client.
+            epoch_dual_base_perclient = []
+            dual_base_global = global_norm(
+                [a - b for a, b in zip(W_global, W_global_prev)]
+            ).item()
+
+            # Snapshot z^k for per-client BB Lipschitz estimate (W_global is
+            # constant across the client loop within a single epoch).
+            z_curr_bb = [w.clone().detach() for w in W_global]
+            grad_curr_per_client = [None for _ in range(args.n_parties)]
 
             for sb in range(args.n_parties):
                 dataidxs = net_dataidx_map[sb]
@@ -1479,6 +1630,18 @@ if __name__ == '__main__':
 
                 gradients = [param.grad for param in model.parameters()]
 
+                # Snapshot per-client gradient at z^k (W_global) for BB
+                # Lipschitz estimation. Only kept when a Lipschitz mode is
+                # active to avoid per-party extra memory otherwise.
+                if sigma_mode in (
+                    "online_convex_bal_lipschitz_oldres",
+                    "online_convex_bal_lipschitz_newres",
+                ):
+                    grad_curr_per_client[sb] = [
+                        g.detach().clone() if g is not None else None
+                        for g in gradients
+                    ]
+
                 with torch.no_grad():
                     current_sigma = sigma_b[sb]
                     current_rho = rho_lr
@@ -1524,6 +1687,7 @@ if __name__ == '__main__':
                     epoch_primal_res.append(primal_res.item())
                     epoch_dual_res.append(dual_res.item())
                     epoch_delta_y.append(dual_base.item())
+                    epoch_dual_base_perclient.append(dual_base.item())
 
                 # updated_iteration += 1
                 zero_grad(model.parameters())
@@ -1545,6 +1709,75 @@ if __name__ == '__main__':
             sigma_loss_list = []
             sigma_target_list = []
             sigma_grad_u_list = []
+            # Per-client Lipschitz-floor logging slots (filled in dispatch).
+            log_L_hat_list = [None for _ in range(args.n_parties)]
+            floor_active_list = [None for _ in range(args.n_parties)]
+            eta_u_eff = None
+
+            # ---- Per-client BB Lipschitz estimate. Needs previous round's
+            # gradient and z, so only fires from epoch 1. Uses z_curr_bb (a
+            # shared snapshot of W_global taken before any update this epoch)
+            # and each client's locally-held gradient at z_curr_bb.
+            L_hat_tensor_per_client = [None for _ in range(args.n_parties)]
+            if sigma_mode in (
+                "online_convex_bal_lipschitz_oldres",
+                "online_convex_bal_lipschitz_newres",
+            ):
+                with torch.no_grad():
+                    dz_tensors = [a - b for a, b in zip(z_curr_bb, z_prev_bb)]
+                    dz_norm = global_norm(dz_tensors)
+                    dz_ok = dz_norm.item() >= lipschitz_min_dz
+                    for sb in range(args.n_parties):
+                        g_prev = grad_prev_per_client[sb]
+                        g_curr = grad_curr_per_client[sb]
+                        if g_prev is not None and g_curr is not None and dz_ok:
+                            dg_tensors = []
+                            for a, b in zip(g_curr, g_prev):
+                                if a is None and b is None:
+                                    continue
+                                if a is None:
+                                    dg_tensors.append(-b)
+                                elif b is None:
+                                    dg_tensors.append(a)
+                                else:
+                                    dg_tensors.append(a - b)
+                            dg_norm = global_norm(dg_tensors)
+                            L_hat_raw = torch.clamp(dg_norm / dz_norm, max=lipschitz_max_val)
+                            L_hat_raw_val = float(L_hat_raw.item())
+                            if L_hat_raw_tv_prev_per_client[sb] is not None:
+                                TV_L_hat_raw_per_client[sb] += abs(
+                                    L_hat_raw_val - L_hat_raw_tv_prev_per_client[sb]
+                                )
+                            L_hat_raw_tv_prev_per_client[sb] = L_hat_raw_val
+                            L_hat_ema_per_client[sb] = (
+                                lipschitz_ema_beta * L_hat_ema_per_client[sb]
+                                + (1.0 - lipschitz_ema_beta) * L_hat_raw
+                            )
+                            L_hat_ema_val = float(L_hat_ema_per_client[sb].item())
+                            TV_L_hat_per_client[sb] += abs(
+                                L_hat_ema_val - L_hat_tv_prev_per_client[sb]
+                            )
+                            L_hat_tv_prev_per_client[sb] = L_hat_ema_val
+                            L_hat_buffer_per_client[sb].append(float(L_hat_raw.item()))
+                            if len(L_hat_buffer_per_client[sb]) > lipschitz_window_size:
+                                L_hat_buffer_per_client[sb].pop(0)
+
+                        if lipschitz_estimator == "ema":
+                            L_hat_tensor_per_client[sb] = L_hat_ema_per_client[sb].clone()
+                        elif lipschitz_estimator == "running_min" and len(L_hat_buffer_per_client[sb]) > 0:
+                            L_hat_tensor_per_client[sb] = torch.tensor(
+                                min(L_hat_buffer_per_client[sb]), device=device
+                            )
+                        elif lipschitz_estimator == "running_median" and len(L_hat_buffer_per_client[sb]) > 0:
+                            sorted_buf = sorted(L_hat_buffer_per_client[sb])
+                            n = len(sorted_buf)
+                            if n % 2 == 0:
+                                med = 0.5 * (sorted_buf[n // 2 - 1] + sorted_buf[n // 2])
+                            else:
+                                med = sorted_buf[n // 2]
+                            L_hat_tensor_per_client[sb] = torch.tensor(med, device=device)
+                        else:
+                            L_hat_tensor_per_client[sb] = torch.tensor(0.0, device=device)
 
             if epoch % 10 == 0 and 0 < epoch:
                 if sigma_mode == "heuristic" and ((epoch + 1) % sigma_update_freq == 0):
@@ -1694,6 +1927,59 @@ if __name__ == '__main__':
                         #     f"target={sigma_target.item():.4f} "
                         #     f"grad={grad_u.item():.4f}"
                         # )
+                elif sigma_mode in (
+                    "online_convex_bal_lipschitz_oldres",
+                    "online_convex_bal_lipschitz_newres",
+                ) and ((epoch + 1) % sigma_update_freq == 0):
+                    # textbook_sc uses mu = 2 (loss (u-tau)^2 is 2-strongly-convex).
+                    if eta_u_decay == "inverse":
+                        eta_u_eff = eta_u / (epoch + 1)
+                    elif eta_u_decay == "inv_sqrt":
+                        eta_u_eff = eta_u / math.sqrt(epoch + 1)
+                    elif eta_u_decay == "textbook_sc":
+                        eta_u_eff = 1.0 / (2.0 * (epoch + 1))
+                    else:
+                        eta_u_eff = eta_u
+
+                    use_global_dual = (sigma_mode == "online_convex_bal_lipschitz_oldres")
+
+                    for sb in range(args.n_parties):
+                        old_u = u_sigma_b[sb].detach()
+                        eps_val = getattr(args, "eps", 1e-12)
+
+                        cur_primal = float(epoch_primal_res[sb])
+                        if use_global_dual:
+                            cur_delta_y = float(dual_base_global)
+                        else:
+                            cur_delta_y = float(epoch_dual_base_perclient[sb])
+
+                        L_hat_arg = (
+                            L_hat_tensor_per_client[sb]
+                            if L_hat_tensor_per_client[sb] is not None
+                            else torch.tensor(0.0, device=device)
+                        )
+
+                        (u_new, sigma_loss, sigma_target,
+                         lf_log_L, lf_floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
+                            u=old_u,
+                            primal_res=torch.tensor(cur_primal, device=device),
+                            delta_y=torch.tensor(cur_delta_y, device=device),
+                            L_hat=L_hat_arg,
+                            eta_u=eta_u_eff,
+                            G_clip=G_clip,
+                            u_min=math.log(sigma_min),
+                            u_max=math.log(sigma_max),
+                            eps=eps_val,
+                        )
+
+                        u_sigma_b[sb] = u_new.detach()
+                        sigma_b[sb] = float(torch.exp(u_sigma_b[sb]).item())
+
+                        sigma_loss_list.append(float(sigma_loss.item()))
+                        sigma_target_list.append(float(sigma_target.item()))
+                        sigma_grad_u_list.append(float(grad_u.item()))
+                        log_L_hat_list[sb] = float(lf_log_L.item())
+                        floor_active_list[sb] = float(lf_floor_active.item())
                 elif sigma_mode == "online_hybrid" and ((epoch + 1) % sigma_update_freq == 0):
                     for sb in range(args.n_parties):
                         old_u = u_sigma_b[sb].detach()
@@ -1780,6 +2066,18 @@ if __name__ == '__main__':
             test_record.append(test_acc)
             logger.info('>> Global Model Test accuracy: %f' % test_acc)
 
+            # Accumulate per-client sigma path length at epoch boundary.
+            for sb_i in range(args.n_parties):
+                log_sigma_now = math.log(max(float(sigma_b[sb_i]), 1e-12))
+                TV_sigma_per_client[sb_i] += abs(
+                    float(sigma_b[sb_i]) - sigma_tv_prev_per_client[sb_i]
+                )
+                TV_log_sigma_per_client[sb_i] += abs(
+                    log_sigma_now - log_sigma_tv_prev_per_client[sb_i]
+                )
+                sigma_tv_prev_per_client[sb_i] = float(sigma_b[sb_i])
+                log_sigma_tv_prev_per_client[sb_i] = log_sigma_now
+
             if getattr(args, "use_wandb", False):
                 log_dict = {
                     "train/acc": train_acc,
@@ -1799,6 +2097,16 @@ if __name__ == '__main__':
                 log_dict[f"log_ratio_primal_over_dualbase/client_{i}"] = math.log(max(primal_res_hist[i], 1e-12)) - math.log(max(delta_y_hist[i], 1e-12))
                 log_dict[f"target_exp/client_{i}"] = math.exp(sigma_target_list[i]) if i < len(sigma_target_list) else None
 
+                # Aggregate path-length signals across clients.
+                log_dict["sigma/TV_mean"] = sum(TV_sigma_per_client) / max(args.n_parties, 1)
+                log_dict["sigma/TV_max"] = max(TV_sigma_per_client)
+                log_dict["sigma/log_TV_mean"] = sum(TV_log_sigma_per_client) / max(args.n_parties, 1)
+                log_dict["sigma/log_TV_max"] = max(TV_log_sigma_per_client)
+                log_dict["L_hat/TV_mean"] = sum(TV_L_hat_per_client) / max(args.n_parties, 1)
+                log_dict["L_hat/TV_max"] = max(TV_L_hat_per_client)
+                log_dict["L_hat_raw/TV_mean"] = sum(TV_L_hat_raw_per_client) / max(args.n_parties, 1)
+                log_dict["L_hat_raw/TV_max"] = max(TV_L_hat_raw_per_client)
+
                 for i in range(args.n_parties):
                     log_dict[f"primal_res/client_{i}"] = primal_res_hist[i]
                     log_dict[f"dual_res/client_{i}"] = dual_res_hist[i]
@@ -1806,6 +2114,10 @@ if __name__ == '__main__':
                     log_dict[f"sigma/client_{i}"] = sigma_b[i]
                     log_dict[f"log_sigma/client_{i}"] = math.log(max(sigma_b[i], 1e-12))
                     log_dict[f"sigma_change/client_{i}"] = sigma_b[i] - sigma_before_epoch[i]
+                    log_dict[f"sigma/TV/client_{i}"] = TV_sigma_per_client[i]
+                    log_dict[f"sigma/log_TV/client_{i}"] = TV_log_sigma_per_client[i]
+                    log_dict[f"L_hat/TV/client_{i}"] = TV_L_hat_per_client[i]
+                    log_dict[f"L_hat_raw/TV/client_{i}"] = TV_L_hat_raw_per_client[i]
                     log_dict[f"primal_over_dualbase/client_{i}"] = primal_res_hist[i] / max(delta_y_hist[i], 1e-12)
                     log_dict[f"log_primal_over_dualbase/client_{i}"] = math.log(max(primal_res_hist[i], 1e-12)) - math.log(max(delta_y_hist[i], 1e-12))
                     log_dict[f"sigma_times_dualbase/client_{i}"] = sigma_b[i] * delta_y_hist[i]
@@ -1825,7 +2137,34 @@ if __name__ == '__main__':
                 if len(sigma_grad_u_list) > 0:
                     log_dict["sigma_grad_u/avg"] = sum(sigma_grad_u_list) / len(sigma_grad_u_list)
 
+                if sigma_mode in (
+                    "online_convex_bal_lipschitz_oldres",
+                    "online_convex_bal_lipschitz_newres",
+                ):
+                    log_dict["sigma/dual_base_global"] = dual_base_global
+                    if eta_u_eff is not None:
+                        log_dict["sigma/eta_u_eff"] = float(eta_u_eff)
+                    for i in range(args.n_parties):
+                        log_dict[f"sigma/L_hat_ema/client_{i}"] = float(L_hat_ema_per_client[i].item())
+                        log_dict[f"sigma/L_hat_buffer_size/client_{i}"] = len(L_hat_buffer_per_client[i])
+                        if log_L_hat_list[i] is not None:
+                            log_dict[f"sigma/log_L_hat/client_{i}"] = log_L_hat_list[i]
+                            log_dict[f"sigma/L_hat/client_{i}"] = math.exp(log_L_hat_list[i])
+                            log_dict[f"sigma/floor_active/client_{i}"] = floor_active_list[i]
+
                 wandb.log(log_dict, step=epoch)
+
+            # Rotate BB state: current round's grad/z become previous for next
+            # round. Only rotates when a Lipschitz mode is active so the memory
+            # cost (n_parties x |params|) is off-path otherwise.
+            if sigma_mode in (
+                "online_convex_bal_lipschitz_oldres",
+                "online_convex_bal_lipschitz_newres",
+            ):
+                for sb in range(args.n_parties):
+                    if grad_curr_per_client[sb] is not None:
+                        grad_prev_per_client[sb] = grad_curr_per_client[sb]
+                z_prev_bb = z_curr_bb
 
         print('######################################################')
         print('The highest test accuracy is:', max(test_record))
