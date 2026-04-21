@@ -424,6 +424,13 @@ def get_args():
     # online OGD update on u = log(rho)
     parser.add_argument('--eta_u', type=float, default=0.05,
                         help='step size for online OGD update of u=log(sigma)')
+    parser.add_argument('--eta_u_decay', type=str, default='none',
+                        choices=['none', 'inverse', 'inv_sqrt'],
+                        help='diminishing step-size schedule for OGD update of '
+                             'u=log(sigma). none (default) = constant eta_u. '
+                             'inverse = eta_u/(k+1), the strongly-convex OGD rate. '
+                             'inv_sqrt = eta_u/sqrt(k+1), the general OGD rate. '
+                             'k is the communication round.')
     parser.add_argument('--G_clip', type=float, default=10.0,
                         help='gradient clipping threshold for u update')
     parser.add_argument('--task_lambda', type=float, default=1.0,
@@ -1432,6 +1439,7 @@ if __name__ == '__main__':
         sigma_max = getattr(args, "sigma_max", 1e6)
 
         eta_u = getattr(args, "eta_u", 0.05)
+        eta_u_decay = getattr(args, "eta_u_decay", "none")
         G_clip = getattr(args, "G_clip", 10.0)
         task_lambda = getattr(args, "task_lambda", 1.0)
 
@@ -1613,6 +1621,7 @@ if __name__ == '__main__':
             avg_delta_y = sum(alpha_b[i] * epoch_delta_y[i] for i in range(args.n_parties))
 
             # Initialize sigma diagnostics (overwritten when sigma update fires)
+            eta_u_eff = None
             sigma_loss = None
             sigma_target = None
             grad_u = None
@@ -1715,13 +1724,22 @@ if __name__ == '__main__':
                 elif sigma_mode == "online_convex_bal_lipschitz":
                     u = u_sigma.detach()
                     L_hat_arg = L_hat_tensor if L_hat_tensor is not None else torch.tensor(0.0, device=device)
+                    # Diminishing step-size schedule. (u-tau)^2 is 2-strongly-convex
+                    # in u, so the textbook rate for strongly-convex OGD is 1/(k+1);
+                    # inv_sqrt is the general rate. k = communication round.
+                    if eta_u_decay == "inverse":
+                        eta_u_eff = eta_u / (epoch + 1)
+                    elif eta_u_decay == "inv_sqrt":
+                        eta_u_eff = eta_u / math.sqrt(epoch + 1)
+                    else:
+                        eta_u_eff = eta_u
                     (u_new, sigma_loss, sigma_target,
                      lf_log_L, lf_floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
                         u=u,
                         primal_res=torch.tensor(avg_primal_res, device=device),
                         delta_y=torch.tensor(avg_delta_y, device=device),
                         L_hat=L_hat_arg,
-                        eta_u=eta_u,
+                        eta_u=eta_u_eff,
                         G_clip=G_clip,
                         u_min=math.log(sigma_min),
                         u_max=math.log(sigma_max),
@@ -1813,6 +1831,8 @@ if __name__ == '__main__':
                     if L_hat_tensor is not None:
                         log_dict["sigma/L_hat_ema"] = float(L_hat_tensor.item())
                     log_dict["sigma/L_hat_buffer_size"] = len(L_hat_buffer)
+                    if eta_u_eff is not None:
+                        log_dict["sigma/eta_u_eff"] = float(eta_u_eff)
 
                 wandb.log(log_dict, step=epoch)
 

@@ -1,7 +1,7 @@
 """Generator for the Lipschitz-floor (hard-projection) adaptive-sigma pilot.
 
 Cases: {mnist, fmnist} x {label1, label3} x sigma_0 in {1e2, 1e3, 1e4}
-       x lipschitz_estimator in ESTIMATORS.
+       x eta_u_decay in ETA_U_DECAYS.
 Each script runs 3 seeds sequentially. Scripts are distributed round-robin
 across the GPUs listed in CUDA_DEVICES and launched in parallel.
 
@@ -9,17 +9,21 @@ The core claim under test: with --sigma_mode online_convex_bal_lipschitz (hard
 projection onto {u >= log L_hat}), the final test accuracy is insensitive to
 sigma_0 -- all three initial values should converge to similar accuracy.
 
-Secondary pilot (2026-04-19): on fmnist, the EMA estimator overshoots by ~20x
-and pins sigma too high. `running_min` over a fixed window is a candidate fix
-that does not introduce a new scalar knob (only a window size). EMA stays as
-the default for backward compat; this sweep runs both side-by-side.
+Pilot history:
+- 2026-04-19: running_min estimator tested against EMA; EMA won on sigma0-robustness
+  and accuracy, so the estimator axis was dropped (EMA only). See memory
+  project_lipschitz_estimator_ema_chosen.md.
+- 2026-04-19 (current): decay schedule pilot. Previous runs showed sigma limit
+  cycles (esp. fmnist) due to constant eta_u fighting the Lipschitz projection.
+  Compare eta_u_decay in {none, inverse} (latter = 1/(k+1), textbook rate for
+  strongly-convex OGD on the (u - tau)^2 loss -- not a new tunable).
 """
 
 import stat
 import subprocess
 from pathlib import Path
 
-OUTPUT_DIR = Path("generated_sisa_lipschitz_floor_runs")
+OUTPUT_DIR = Path("generated_sisa_lipschitz_eta_u_adjustment")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 CUDA_DEVICES = ["4", "5", "6", "7"]
@@ -28,10 +32,14 @@ SEEDS = [0, 1, 2]
 
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
 
-# Estimator sweep. ema = historical behavior; running_min is the candidate
-# fmnist fix (window size below). Comment out entries to shrink the sweep.
-ESTIMATORS = ["ema", "running_min"]
+# Estimator (fixed to ema; running_min lost the earlier pilot).
+ESTIMATOR = "ema"
 LIPSCHITZ_WINDOW_SIZE = "20"
+
+# Decay schedule for eta_u. Textbook OGD: constant vs 1/(k+1) (strongly-convex rate).
+# Both are "no new knob" choices covered by regret-bound theory.
+ETA_U_DECAYS = ["none", "inverse"]
+# ETA_U_DECAYS = ["none", "inverse"]
 
 ONLINE_ENTRY = "experiment_sisa_practise_online.py"
 
@@ -62,9 +70,10 @@ LIPSCHITZ_EXTRA_ARGS = {
     "sigma_min": "1e-6",
     "sigma_max": "1e6",
     "eta_u": "0.05",
+    "eta_u_decay": "${eta_u_decay}",
     "G_clip": "5.0",
     "rho_lr": "1e2",
-    "lipschitz_estimator": "${estimator}",
+    "lipschitz_estimator": ESTIMATOR,
     "lipschitz_window_size": LIPSCHITZ_WINDOW_SIZE,
     "lipschitz_ema_beta": "0.9",
     "lipschitz_min_dz": "1e-6",
@@ -73,8 +82,10 @@ LIPSCHITZ_EXTRA_ARGS = {
 
 CASES = [
     {"case_name": "mnist_label1_n10",  "dataset": "mnist",  "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "mnist_label2_n10",  "dataset": "mnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
     {"case_name": "mnist_label3_n10",  "dataset": "mnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
     {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
     {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
 ]
 
@@ -95,8 +106,8 @@ def make_executable(path: Path):
     path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
 
 
-def make_experiment_tag(sigma_lr_val: str, estimator: str) -> str:
-    return f"lipschitz_{estimator}_sig{sigma_lr_val}"
+def make_experiment_tag(sigma_lr_val: str, eta_u_decay: str) -> str:
+    return f"lipschitz_decay{eta_u_decay}_sig{sigma_lr_val}"
 
 
 def build_wandb_names(case: dict, tag: str):
@@ -127,7 +138,7 @@ def build_command(case: dict, tag: str, cuda_device: str) -> str:
     return "\n".join(lines)
 
 
-def build_script_text(case: dict, sigma_lr: str, estimator: str,
+def build_script_text(case: dict, sigma_lr: str, eta_u_decay: str,
                       tag: str, cuda_device: str) -> str:
     cmd = build_command(case, tag=tag, cuda_device=cuda_device)
     header = [
@@ -136,7 +147,7 @@ def build_script_text(case: dict, sigma_lr: str, estimator: str,
         "set -e",
         "",
         f"sigma_lr={sigma_lr}",
-        f"estimator={estimator}",
+        f"eta_u_decay={eta_u_decay}",
         "",
         "for seed in 0 1 2",
         "do",
@@ -153,18 +164,18 @@ def main():
 
     jobs = []
     for case in CASES:
-        for estimator in ESTIMATORS:
+        for decay in ETA_U_DECAYS:
             for slr in SIGMA_LR_VALUES:
-                tag = make_experiment_tag(slr, estimator)
-                jobs.append((case, slr, estimator, tag))
+                tag = make_experiment_tag(slr, decay)
+                jobs.append((case, slr, decay, tag))
 
     generated_scripts = []
-    for idx, (case, slr, estimator, tag) in enumerate(jobs):
+    for idx, (case, slr, decay, tag) in enumerate(jobs):
         gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
         script_name = f"{case['case_name']}_{tag}.sh"
         script_path = OUTPUT_DIR / script_name
         script_text = build_script_text(
-            case, sigma_lr=slr, estimator=estimator, tag=tag, cuda_device=gpu
+            case, sigma_lr=slr, eta_u_decay=decay, tag=tag, cuda_device=gpu
         )
         script_path.write_text(script_text, encoding="utf-8")
         make_executable(script_path)
