@@ -2,7 +2,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs")
+OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs_updated_local_update")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 # physical GPU ids to distribute work across
@@ -20,6 +20,7 @@ EPOCHS_VALUES = ["3", "10"]
 LR_VALUES = ["0.001", "0.01"]
 
 EXACT_ADMM_ENTRY = "experiment_sisa_practise_admm.py"
+ORIGINAL_ENTRY = "experiment_sisa_practise_wandb.py"
 
 COMMON_ARGS = {
     "batch-size": "64",
@@ -38,7 +39,7 @@ COMMON_ARGS = {
     "init_seed": "${seed}",
     "optimizer": "sgd",
     "use_wandb": "true",
-    "wandb_project": "sisa-exact-admm-sgd-epochs",
+    "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
 }
 
 ADAPTIVE_EXTRA_ARGS = {
@@ -56,12 +57,15 @@ ADAPTIVE_EXTRA_ARGS = {
 CASES = [
     {"case_name": "mnist_label3_n10", "dataset": "mnist", "partition": "noniid-#label3", "model": "simple-cnn"},
     {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "mnist_label2_n10", "dataset": "mnist", "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
     {"case_name": "mnist_label1_n10", "dataset": "mnist", "partition": "noniid-#label1", "model": "simple-cnn"},
     {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
 ]
 
-FIXED_EXTRA_ARGS = {
-    "sigma_mode": "fixed",
+# Original SISA-ADMM baseline (no sigma_mode logic). Uses experiment_sisa_practise_wandb.py.
+ORIGINAL_EXTRA_ARGS = {
+    "rho_lr": "1e2"
 }
 
 METHODS = [
@@ -74,9 +78,9 @@ METHODS = [
         "sweep_lr": True,
     },
     {
-        "method_name": "sgd_fixed",
-        "entry": EXACT_ADMM_ENTRY,
-        "extra_args": FIXED_EXTRA_ARGS,
+        "method_name": "sgd_original",
+        "entry": ORIGINAL_ENTRY,
+        "extra_args": ORIGINAL_EXTRA_ARGS,
         "sweep_sigma": True,
         "sweep_epochs": True,
         "sweep_lr": True,

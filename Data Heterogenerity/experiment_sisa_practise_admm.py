@@ -997,6 +997,12 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         for x, target in train_dl_local:
             x, target = x.to(device), target.to(device).long()
 
+            # Reset model params to w_global before EACH batch so every SGD
+            # step starts from the anchor (Option A: fresh-start SGD).
+            with torch.no_grad():
+                for p, wg in zip(model.parameters(), w_global):
+                    p.copy_(wg)
+
             optimizer.zero_grad()
             out = model(x)
             task_loss = criterion(out, target)
