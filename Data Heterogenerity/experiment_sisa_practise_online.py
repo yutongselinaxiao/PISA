@@ -1492,6 +1492,13 @@ if __name__ == '__main__':
         L_hat_ema = torch.tensor(0.0, device=device)
         L_hat_buffer = []  # ring buffer of raw L_hat samples, for running_min/median
 
+        # Per-layer L̂ diagnostic (EMA of BB ratios per parameter group).
+        # Used to decide whether scalar L̂ = max_j L̂_j is bottlenecked by one
+        # heavy layer — if max/median ratio >= ~22x, per-layer sigma can
+        # plausibly close the accuracy gap to baseline SISA (tuned sigma=1000).
+        param_names_bb = [n for n, _ in model.named_parameters()]
+        L_hat_ema_per_layer = [0.0] * len(param_names_bb)
+
         # ---- Total-variation accumulators (path-length proxy).
         # Validates the bounded-variation theorem in
         # notes/lipschitz_floor_bounded_variation.tex: check whether
@@ -1699,6 +1706,30 @@ if __name__ == '__main__':
                             L_hat_buffer.append(float(L_hat_raw.item()))
                             if len(L_hat_buffer) > lipschitz_window_size:
                                 L_hat_buffer.pop(0)
+
+                            # Per-layer L̂ diagnostic: decompose the scalar BB
+                            # ratio by parameter group. Uses index j directly
+                            # (robust to None grads) and EMA-smooths each.
+                            for j in range(len(z_curr_bb)):
+                                dz_j = z_curr_bb[j] - z_prev_bb[j]
+                                dz_j_norm = float(dz_j.norm().item())
+                                if dz_j_norm < lipschitz_min_dz:
+                                    continue
+                                a = grad_global_curr[j]
+                                b = grad_global_prev[j]
+                                if a is None and b is None:
+                                    continue
+                                if a is None:
+                                    dg_j_norm = float(b.detach().norm().item())
+                                elif b is None:
+                                    dg_j_norm = float(a.detach().norm().item())
+                                else:
+                                    dg_j_norm = float((a.detach() - b.detach()).norm().item())
+                                ratio_j = min(dg_j_norm / dz_j_norm, lipschitz_max)
+                                L_hat_ema_per_layer[j] = (
+                                    lipschitz_ema_beta * L_hat_ema_per_layer[j]
+                                    + (1.0 - lipschitz_ema_beta) * ratio_j
+                                )
                     # Dispatch on estimator choice. Before any raw sample lands (buffer
                     # empty), running_* fall back to L_hat=0 -> floor inactive.
                     if lipschitz_estimator == "ema":
@@ -1887,6 +1918,25 @@ if __name__ == '__main__':
                     log_dict["sigma/L_hat_buffer_size"] = len(L_hat_buffer)
                     if eta_u_eff is not None:
                         log_dict["sigma/eta_u_eff"] = float(eta_u_eff)
+
+                    # Per-layer L̂ diagnostic: summary stats + per-group details.
+                    # max/median >= ~22x suggests per-layer sigma is worth pursuing.
+                    nonzero_per_layer = [v for v in L_hat_ema_per_layer if v > 0]
+                    if len(nonzero_per_layer) > 0:
+                        sorted_pl = sorted(nonzero_per_layer)
+                        n_pl = len(sorted_pl)
+                        median_L = (sorted_pl[n_pl // 2] if n_pl % 2 == 1
+                                    else 0.5 * (sorted_pl[n_pl // 2 - 1] + sorted_pl[n_pl // 2]))
+                        max_L = sorted_pl[-1]
+                        min_L = sorted_pl[0]
+                        log_dict["sigma/L_hat_per_layer/max"] = max_L
+                        log_dict["sigma/L_hat_per_layer/min"] = min_L
+                        log_dict["sigma/L_hat_per_layer/median"] = median_L
+                        log_dict["sigma/L_hat_per_layer/max_over_median"] = max_L / max(median_L, 1e-12)
+                        log_dict["sigma/L_hat_per_layer/max_over_min"] = max_L / max(min_L, 1e-12)
+                    for j, name in enumerate(param_names_bb):
+                        if L_hat_ema_per_layer[j] > 0:
+                            log_dict[f"sigma/L_hat_per_layer/{name}"] = L_hat_ema_per_layer[j]
 
                 wandb.log(log_dict, step=epoch)
 
