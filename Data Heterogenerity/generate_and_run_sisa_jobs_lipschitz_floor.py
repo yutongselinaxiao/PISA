@@ -55,6 +55,10 @@ ETA_U_DECAYS = ["textbook_sc"]
 
 ONLINE_ENTRY = "experiment_sisa_practise_online.py"
 
+# Original-SISA baseline entry (constant sigma, no adaptive update). Used to
+# generate companion runs at the same sigma_0 sweep for direct comparison.
+ORIGINAL_ENTRY = "experiment_sisa_practise_wandb.py"
+
 COMMON_ARGS = {
     "alg": "sisa",
     "lr": "0.001",
@@ -93,12 +97,17 @@ LIPSCHITZ_EXTRA_ARGS = {
 }
 
 CASES = [
-    {"case_name": "mnist_label1_n10",  "dataset": "mnist",  "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "mnist_label2_n10",  "dataset": "mnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "mnist_label3_n10",  "dataset": "mnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
-    {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
+    # 2026-04-21: temporarily replaced mnist/fmnist cases with cifar10 cases
+    # to probe the adaptive-vs-baseline gap on a harder dataset.
+    # {"case_name": "mnist_label1_n10",  "dataset": "mnist",  "partition": "noniid-#label1", "model": "simple-cnn"},
+    # {"case_name": "mnist_label2_n10",  "dataset": "mnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
+    # {"case_name": "mnist_label3_n10",  "dataset": "mnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "cifar10_label1_n10", "dataset": "cifar10", "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "cifar10_label2_n10", "dataset": "cifar10", "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "cifar10_label3_n10", "dataset": "cifar10", "partition": "noniid-#label3", "model": "simple-cnn"},
 ]
 
 RUN_AFTER_GENERATION = True
@@ -120,6 +129,10 @@ def make_executable(path: Path):
 
 def make_experiment_tag(sigma_lr_val: str, eta_u_decay: str) -> str:
     return f"lipschitz_decay{eta_u_decay}_sig{sigma_lr_val}"
+
+
+def make_original_tag(sigma_lr_val: str) -> str:
+    return f"original_sig{sigma_lr_val}"
 
 
 def build_wandb_names(case: dict, tag: str):
@@ -150,6 +163,30 @@ def build_command(case: dict, tag: str, cuda_device: str) -> str:
     return "\n".join(lines)
 
 
+def build_original_command(case: dict, tag: str, cuda_device: str) -> str:
+    """Command for the fixed-sigma baseline (experiment_sisa_practise_wandb.py).
+    Reuses COMMON_ARGS; no lipschitz / sigma_mode flags since this entry
+    accepts only --sigma_lr (constant)."""
+    args = {}
+    args.update(COMMON_ARGS)
+    args.update({
+        "model": case["model"],
+        "dataset": case["dataset"],
+        "partition": case["partition"],
+    })
+
+    wandb_group, wandb_run_name = build_wandb_names(case, tag)
+    args["wandb_group"] = wandb_group
+    args["wandb_run_name"] = wandb_run_name
+
+    lines = [f"CUDA_VISIBLE_DEVICES={cuda_device} python {ORIGINAL_ENTRY} \\"]
+    items = list(args.items())
+    for i, (k, v) in enumerate(items):
+        suffix = " \\" if i < len(items) - 1 else ""
+        lines.append(f"    {format_arg(k, v)}{suffix}")
+    return "\n".join(lines)
+
+
 def build_script_text(case: dict, sigma_lr: str, eta_u_decay: str,
                       tag: str, cuda_device: str) -> str:
     cmd = build_command(case, tag=tag, cuda_device=cuda_device)
@@ -160,6 +197,25 @@ def build_script_text(case: dict, sigma_lr: str, eta_u_decay: str,
         "",
         f"sigma_lr={sigma_lr}",
         f"eta_u_decay={eta_u_decay}",
+        "",
+        "for seed in 0 1 2",
+        "do",
+        cmd,
+        "done",
+        "",
+    ]
+    return "\n".join(header)
+
+
+def build_original_script_text(case: dict, sigma_lr: str,
+                               tag: str, cuda_device: str) -> str:
+    cmd = build_original_command(case, tag=tag, cuda_device=cuda_device)
+    header = [
+        "#!/bin/bash",
+        "",
+        "set -e",
+        "",
+        f"sigma_lr={sigma_lr}",
         "",
         "for seed in 0 1 2",
         "do",
@@ -181,6 +237,14 @@ def main():
                 tag = make_experiment_tag(slr, decay)
                 jobs.append((case, slr, decay, tag))
 
+    # Companion fixed-sigma baseline jobs (experiment_sisa_practise_wandb.py)
+    # at the same sigma_lr sweep, one script per case x sigma_lr.
+    original_jobs = []
+    for case in CASES:
+        for slr in SIGMA_LR_VALUES:
+            tag = make_original_tag(slr)
+            original_jobs.append((case, slr, tag))
+
     generated_scripts = []
     for idx, (case, slr, decay, tag) in enumerate(jobs):
         gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
@@ -193,6 +257,21 @@ def main():
         make_executable(script_path)
         generated_scripts.append(script_path)
         print(f"Generated: {script_path}  [GPU {gpu}]")
+
+    # Round-robin GPU assignment continues from where adaptive jobs left off
+    # so that original-SISA baselines spread across all CUDA_DEVICES too.
+    for j, (case, slr, tag) in enumerate(original_jobs):
+        idx = len(jobs) + j
+        gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
+        script_name = f"{case['case_name']}_{tag}.sh"
+        script_path = OUTPUT_DIR / script_name
+        script_text = build_original_script_text(
+            case, sigma_lr=slr, tag=tag, cuda_device=gpu
+        )
+        script_path.write_text(script_text, encoding="utf-8")
+        make_executable(script_path)
+        generated_scripts.append(script_path)
+        print(f"Generated: {script_path}  [GPU {gpu}]  (original)")
 
     total = len(generated_scripts)
     print(f"\nGenerated {total} scripts across {len(CUDA_DEVICES)} GPUs.")
