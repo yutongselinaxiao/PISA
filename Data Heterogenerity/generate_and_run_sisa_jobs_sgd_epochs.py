@@ -15,14 +15,16 @@ SEEDS = [0, 1, 2]
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
 
 # Sweep over local epochs
-EPOCHS_VALUES = ["3", "10"]
+EPOCHS_VALUES = ["1", "3", "10"]
 
 # Sweep over local learning rate
-LR_VALUES = ["0.001", "0.01"]
+LR_VALUES = ["0.001"]
 
 EXACT_ADMM_ENTRY = "experiment_sisa_practise_admm.py"
 ORIGINAL_ENTRY = "experiment_sisa_practise_wandb.py"
 
+# Args for the adaptive (sgd_adaptive) entry point. Uses --optimizer=sgd
+# and the adaptive sigma machinery defined in ADAPTIVE_EXTRA_ARGS.
 COMMON_ARGS = {
     "batch-size": "64",
     "n_parties": "10",
@@ -42,6 +44,31 @@ COMMON_ARGS = {
     "use_wandb": "true",
     "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
     # "local_log_dir": str(LOCAL_METRICS_DIR),
+}
+
+# Args for the original (sgd_original) entry point. Mirrors run_sisa_cifar.sh
+# exactly, only dataset / partition / sigma_lr (and seed) are swept. No
+# --optimizer flag (the original sisa branch uses a manual RMSProp-like
+# update and ignores args.optimizer). Wandb flags added on top so runs
+# still show up on the dashboard.
+ORIGINAL_COMMON_ARGS = {
+    "batch-size": "64",
+    "n_parties": "10",
+    "mu": "0.01",
+    "rho": "0.9",
+    "comm_round": "500",
+    "beta": "0.5",
+    "device": "cuda:0",
+    "datadir": "/data/yutong/datasets",
+    "logdir": "./logs/",
+    "noise": "0",
+    "sample": "1",
+    "sigma_lr": "${sigma_lr}",
+    "rho_lr": "1e2",
+    "l2_lambda": "5e-3",
+    "init_seed": "${seed}",
+    "use_wandb": "true",
+    "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
 }
 
 ADAPTIVE_EXTRA_ARGS = {
@@ -66,14 +93,12 @@ CASES = [
 ]
 
 # Original SISA-ADMM baseline (no sigma_mode logic). Uses experiment_sisa_practise_wandb.py.
-ORIGINAL_EXTRA_ARGS = {
-    "rho_lr": "1e2"
-}
-
+# All args are folded into ORIGINAL_COMMON_ARGS above; no extras needed.
 METHODS = [
     {
         "method_name": "sgd_adaptive",
         "entry": EXACT_ADMM_ENTRY,
+        "base_args": COMMON_ARGS,
         "extra_args": ADAPTIVE_EXTRA_ARGS,
         "sweep_sigma": True,
         "sweep_epochs": True,
@@ -82,10 +107,11 @@ METHODS = [
     {
         "method_name": "sgd_original",
         "entry": ORIGINAL_ENTRY,
-        "extra_args": ORIGINAL_EXTRA_ARGS,
+        "base_args": ORIGINAL_COMMON_ARGS,
+        "extra_args": {},
         "sweep_sigma": True,
-        "sweep_epochs": False,
-        "sweep_lr": False,
+        "sweep_epochs": False,  # original ignores args.epochs; pinned to 1
+        "sweep_lr": False,      # pinned to 0.001 (matches run_sisa_cifar.sh)
     },
 ]
 
@@ -119,7 +145,7 @@ def build_wandb_names(case: dict, method_name: str, tag: str):
 def build_command_template(case: dict, method: dict, tag: str, cuda_device: str = "0",
                            epochs: str = "1", lr: str = "0.001") -> str:
     args = {}
-    args.update(COMMON_ARGS)
+    args.update(method.get("base_args", COMMON_ARGS))
     args.update({
         "model": case["model"],
         "dataset": case["dataset"],
