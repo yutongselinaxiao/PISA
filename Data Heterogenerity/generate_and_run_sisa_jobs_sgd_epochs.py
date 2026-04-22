@@ -82,8 +82,8 @@ METHODS = [
         "entry": ORIGINAL_ENTRY,
         "extra_args": ORIGINAL_EXTRA_ARGS,
         "sweep_sigma": True,
-        "sweep_epochs": True,
-        "sweep_lr": True,
+        "sweep_epochs": False,
+        "sweep_lr": False,
     },
 ]
 
