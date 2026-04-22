@@ -1425,8 +1425,29 @@ if __name__ == '__main__':
             logger.info(f"ADMM round {round_idx}")
             W_global_prev = [w.detach().clone() for w in W_global]
 
+            # NOTE: primal update order swapped — global w^{k+1} is now computed
+            # BEFORE the local w_i^{k+1} updates, so each client consumes the
+            # freshly updated w^{k+1} (instead of the previous round's w^k).
+            # this is to use match with the original sisa algorithm
+
             # -----------------------------------------
-            # 1) Local primal step: update each w_i^{k+1}
+            # 1) Global primal step: update w^{k+1} (uses w_i^k, pi^k)
+            # -----------------------------------------
+            W_global = generate_W_global(
+                args.n_parties,
+                W_b_initial,
+                P_b_initial,
+                sigma_lr,
+                alpha_b,
+                l2_lambda
+            )
+
+            with torch.no_grad():
+                for param, w in zip(model.parameters(), W_global):
+                    param.copy_(w)
+
+            # -----------------------------------------
+            # 2) Local primal step: update each w_i^{k+1} using fresh w^{k+1}
             # -----------------------------------------
             new_W_b = []
             local_losses = []
@@ -1478,18 +1499,8 @@ if __name__ == '__main__':
 
             W_b_initial = new_W_b
 
-            # -----------------------------------------
-            # 2) Global primal step: update w^{k+1}
-            # -----------------------------------------
-            W_global = generate_W_global(
-                args.n_parties,
-                W_b_initial,
-                P_b_initial,
-                sigma_lr,
-                alpha_b,
-                l2_lambda
-            )
-
+            # Reload model with W_global so downstream evaluation sees w^{k+1}
+            # (the local loop left model params at the last client's w_i^{k+1}).
             with torch.no_grad():
                 for param, w in zip(model.parameters(), W_global):
                     param.copy_(w)
