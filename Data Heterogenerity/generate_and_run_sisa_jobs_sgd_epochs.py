@@ -4,6 +4,7 @@ from pathlib import Path
 
 OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs_updated_local_update")
 LOG_DIR = OUTPUT_DIR / "logs"
+LOCAL_METRICS_DIR = OUTPUT_DIR / "local_metrics"
 
 # physical GPU ids to distribute work across
 CUDA_DEVICES = ["0", "1", "2", "3"]
@@ -40,6 +41,7 @@ COMMON_ARGS = {
     "optimizer": "sgd",
     "use_wandb": "true",
     "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
+    "local_log_dir": str(LOCAL_METRICS_DIR),
 }
 
 ADAPTIVE_EXTRA_ARGS = {
@@ -162,6 +164,7 @@ def build_script_text(case: dict, method: dict, sigma_lr: str, tag: str,
 def main():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
+    LOCAL_METRICS_DIR.mkdir(parents=True, exist_ok=True)
 
     # Collect all job specs first, then assign GPUs round-robin
     jobs = []

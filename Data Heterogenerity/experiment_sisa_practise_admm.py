@@ -194,6 +194,9 @@ def get_args():
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
     parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
     parser.add_argument('--wandb_run_name', type=str, default=None, help='wandb run name')
+    parser.add_argument('--local_log_dir', type=str, default=None,
+                        help='Directory to save per-round metrics as CSV for offline plotting. '
+                             'Disabled when None.')
     args = parser.parse_args()
     return args
 
@@ -1421,6 +1424,32 @@ if __name__ == '__main__':
 
         test_record = []
 
+        # Local CSV logging for offline plotting (independent of wandb).
+        local_csv_path = None
+        local_csv_file = None
+        local_csv_writer = None
+        local_csv_fields = [
+            "round", "dataset", "partition", "method", "sigma_mode",
+            "sigma_lr_init", "epochs", "lr", "seed",
+            "test_acc", "train_local_admm_loss_avg",
+            "primal_res_avg", "delta_w_global_avg",
+            "sigma_value", "log_sigma_value",
+            "sigma_loss", "sigma_target", "sigma_grad",
+        ]
+        if args.local_log_dir:
+            import csv as _csv
+            os.makedirs(args.local_log_dir, exist_ok=True)
+            run_tag = args.wandb_run_name or f"{args.dataset}_{args.alg}_seed{args.init_seed}"
+            safe_tag = run_tag.replace("/", "_")
+            local_csv_path = os.path.join(args.local_log_dir, f"{safe_tag}.csv")
+            local_csv_file = open(local_csv_path, "w", newline="")
+            local_csv_writer = _csv.DictWriter(local_csv_file, fieldnames=local_csv_fields)
+            local_csv_writer.writeheader()
+
+            meta_path = os.path.join(args.local_log_dir, f"{safe_tag}.meta.json")
+            with open(meta_path, "w") as _mf:
+                json.dump(vars(args), _mf, indent=2, default=str)
+
         for round_idx in range(args.comm_round):
             logger.info(f"ADMM round {round_idx}")
             W_global_prev = [w.detach().clone() for w in W_global]
@@ -1671,6 +1700,34 @@ if __name__ == '__main__':
                     log_dict[f"primal_res/client_{sb}"] = torch.sqrt(client_sq).item()
 
                 wandb.log(log_dict, step=round_idx)
+
+            if local_csv_writer is not None:
+                csv_row = {
+                    "round": round_idx,
+                    "dataset": args.dataset,
+                    "partition": args.partition,
+                    "method": sigma_mode,
+                    "sigma_mode": sigma_mode,
+                    "sigma_lr_init": args.sigma_lr,
+                    "epochs": args.epochs,
+                    "lr": args.lr,
+                    "seed": args.init_seed,
+                    "test_acc": test_acc,
+                    "train_local_admm_loss_avg": sum(local_losses) / max(len(local_losses), 1),
+                    "primal_res_avg": avg_primal_res.item(),
+                    "delta_w_global_avg": avg_dual_base.item(),
+                    "sigma_value": sigma_lr,
+                    "log_sigma_value": math.log(max(sigma_lr, eps_val)),
+                    "sigma_loss": sigma_loss.item() if sigma_loss is not None else "",
+                    "sigma_target": sigma_target.item() if sigma_target is not None else "",
+                    "sigma_grad": sigma_grad.item() if sigma_grad is not None else "",
+                }
+                local_csv_writer.writerow(csv_row)
+                local_csv_file.flush()
+
+        if local_csv_file is not None:
+            local_csv_file.close()
+            logger.info(f"Saved local metrics to {local_csv_path}")
 
         print('######################################################')
         print('The highest test accuracy is:', max(test_record))
