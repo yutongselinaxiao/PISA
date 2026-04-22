@@ -1,15 +1,33 @@
 import stat
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs_updated_local_update")
+OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs_4_22")
 LOG_DIR = OUTPUT_DIR / "logs"
 # LOCAL_METRICS_DIR = OUTPUT_DIR / "local_metrics"
 
-# physical GPU ids to distribute work across
-CUDA_DEVICES = ["0", "1", "2", "3"]
+# physical GPU ids to distribute work across (all 8 H100s)
+CUDA_DEVICES = ["0", "1", "2", "3", "4", "5", "6", "7"]
 
+# Base sweep seeds
 SEEDS = [0, 1, 2]
+
+# Extra seeds to run ONLY on the headline cells, to get tight CIs on the
+# fmnist-label3-beats-SISA claim. Key tuple: (case, method, sigma_lr, epochs, lr).
+EXTRA_SEEDS = [3, 4, 5, 6, 7, 8, 9]
+HEADLINE_CELLS = {
+    ("mnist_label3_n10",  "sgd_adaptive", "1e4", "3", "0.001"),
+    ("fmnist_label3_n10", "sgd_adaptive", "1e4", "3", "0.001"),
+    ("mnist_label3_n10",  "sgd_original", "1e3", "1", "0.001"),
+    ("fmnist_label3_n10", "sgd_original", "1e3", "1", "0.001"),
+}
+
+# Concurrent runs per physical GPU. On H100 80GB, simple-cnn/batch-64 uses
+# ~1GB VRAM and a small fraction of SMs per process, so 8 fits comfortably.
+# Watch `nvidia-smi` — if SM util caps below ~70% per GPU, bump to 10-12.
+MAX_PARALLEL_PER_GPU = 8
 
 # Sweep over initial sigma
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
@@ -42,7 +60,7 @@ COMMON_ARGS = {
     "init_seed": "${seed}",
     "optimizer": "sgd",
     "use_wandb": "true",
-    "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
+    "wandb_project": "sisa-exact-admm-sgd-epochs-4-22",
     # "local_log_dir": str(LOCAL_METRICS_DIR),
 }
 
@@ -68,7 +86,7 @@ ORIGINAL_COMMON_ARGS = {
     "l2_lambda": "5e-3",
     "init_seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "sisa-exact-admm-sgd-epochs-new-local-update",
+    "wandb_project": "sisa-exact-admm-sgd-epochs-4-22",
 }
 
 ADAPTIVE_EXTRA_ARGS = {
@@ -133,7 +151,7 @@ def make_executable(path: Path):
 
 
 def make_experiment_tag(sigma_lr_val: str, epochs_val: str, lr_val: str) -> str:
-    return f"sgd_ep{epochs_val}_lr{lr_val}_sig{sigma_lr_val}_4_16"
+    return f"sgd_ep{epochs_val}_lr{lr_val}_sig{sigma_lr_val}_4_22"
 
 
 def build_wandb_names(case: dict, method_name: str, tag: str):
@@ -168,7 +186,7 @@ def build_command_template(case: dict, method: dict, tag: str, cuda_device: str 
     return "\n".join(lines)
 
 
-def build_script_text(case: dict, method: dict, sigma_lr: str, tag: str,
+def build_script_text(case: dict, method: dict, sigma_lr: str, tag: str, seed: int,
                       cuda_device: str = "0", epochs: str = "1", lr: str = "0.001") -> str:
     cmd = build_command_template(case, method, tag=tag, cuda_device=cuda_device,
                                  epochs=epochs, lr=lr)
@@ -178,11 +196,9 @@ def build_script_text(case: dict, method: dict, sigma_lr: str, tag: str,
         "set -e",
         "",
         f"sigma_lr={sigma_lr}",
+        f"seed={seed}",
         "",
-        "for seed in 0 1 2",
-        "do",
         cmd,
-        "done",
         "",
     ])
 
@@ -204,56 +220,74 @@ def main():
             for slr in sigma_values:
                 for ep in epochs_values:
                     for lr in lr_values:
-                        tag = make_experiment_tag(slr, ep, lr)
-                        script_name = f"{case['case_name']}_{method['method_name']}_{tag}.sh"
-                        jobs.append((case, method, slr, ep, lr, tag, script_name))
+                        key = (case["case_name"], method["method_name"], slr, ep, lr)
+                        seeds_for_cell = list(SEEDS)
+                        if key in HEADLINE_CELLS:
+                            seeds_for_cell.extend(EXTRA_SEEDS)
+                        for seed in seeds_for_cell:
+                            tag = make_experiment_tag(slr, ep, lr)
+                            script_name = f"{case['case_name']}_{method['method_name']}_{tag}_seed{seed}.sh"
+                            jobs.append((case, method, slr, ep, lr, tag, seed, script_name))
 
-    # Round-robin GPU assignment
+    # Round-robin GPU assignment (one script = one seed)
     generated_scripts = []
-    for idx, (case, method, slr, ep, lr, tag, script_name) in enumerate(jobs):
+    for idx, (case, method, slr, ep, lr, tag, seed, script_name) in enumerate(jobs):
         gpu = CUDA_DEVICES[idx % len(CUDA_DEVICES)]
         script_path = OUTPUT_DIR / script_name
         script_text = build_script_text(
-            case, method, sigma_lr=slr, tag=tag, cuda_device=gpu, epochs=ep, lr=lr
+            case, method, sigma_lr=slr, tag=tag, seed=seed,
+            cuda_device=gpu, epochs=ep, lr=lr,
         )
         script_path.write_text(script_text, encoding="utf-8")
         make_executable(script_path)
-        generated_scripts.append(script_path)
+        generated_scripts.append((script_path, gpu))
         print(f"Generated: {script_path}  [GPU {gpu}]")
 
     total = len(generated_scripts)
-    print(f"\nGenerated {total} scripts across {len(CUDA_DEVICES)} GPUs.")
-    print(f"Each script runs {len(SEEDS)} seeds sequentially = {total * len(SEEDS)} total runs.")
+    print(f"\nGenerated {total} single-seed scripts across {len(CUDA_DEVICES)} GPUs.")
+    print(f"Headline cells ({len(HEADLINE_CELLS)}) get seeds {SEEDS + EXTRA_SEEDS}; "
+          f"others get seeds {SEEDS}.")
 
     if not RUN_AFTER_GENERATION:
         print("Not executing scripts.")
         return
 
-    print(f"\nLaunching all scripts in parallel across GPUs {CUDA_DEVICES}...\n")
+    max_workers = len(CUDA_DEVICES) * MAX_PARALLEL_PER_GPU
+    print(f"\nLaunching across GPUs {CUDA_DEVICES} with {MAX_PARALLEL_PER_GPU} "
+          f"concurrent runs per GPU ({max_workers} workers total)...\n")
 
-    processes = []
-    for script_path in generated_scripts:
+    gpu_sems = {g: threading.Semaphore(MAX_PARALLEL_PER_GPU) for g in CUDA_DEVICES}
+    print_lock = threading.Lock()
+
+    def run_one(script_path: Path, gpu: str):
         log_path = LOG_DIR / f"{script_path.stem}.log"
-        print(f"Launching: {script_path} -> {log_path}")
-        log_file = open(log_path, "w")
-        p = subprocess.Popen(
-            ["bash", str(script_path)],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-        )
-        processes.append((script_path, log_path, log_file, p))
-
-    print("\nAll scripts launched.\n")
+        with gpu_sems[gpu]:
+            with print_lock:
+                print(f"Launching: {script_path.name} [GPU {gpu}] -> {log_path}")
+            with open(log_path, "w") as log_file:
+                p = subprocess.Popen(
+                    ["bash", str(script_path)],
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                )
+                ret = p.wait()
+        return script_path, log_path, ret
 
     failed = []
-    for script_path, log_path, log_file, p in processes:
-        ret = p.wait()
-        log_file.close()
-        if ret == 0:
-            print(f"Finished: {script_path}")
-        else:
-            print(f"FAILED: {script_path} with exit code {ret}. See log: {log_path}")
-            failed.append((script_path, ret, log_path))
+    done = 0
+    total = len(generated_scripts)
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(run_one, sp, gpu) for sp, gpu in generated_scripts]
+        for fut in as_completed(futs):
+            script_path, log_path, ret = fut.result()
+            done += 1
+            with print_lock:
+                if ret == 0:
+                    print(f"[{done}/{total}] Finished: {script_path.name}")
+                else:
+                    print(f"[{done}/{total}] FAILED: {script_path.name} "
+                          f"(exit {ret}) -> {log_path}")
+                    failed.append((script_path, ret, log_path))
 
     print("\nExecution finished.")
     if failed:
