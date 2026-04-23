@@ -55,8 +55,10 @@ CHANGE LOG
       run_sisa_cifar.sh uses rho_lr=1e2 for the SISA baseline; without this
       the cifar10 baseline would have been run with the entry point's
       default.
-    * New wandb_project = paper-lipschitz-label1-cifar-extra to isolate
-      these runs from legacy projects.
+    * wandb_project kept as paper-lipschitz-estimator (same as prior
+      textbook_sc runs). New seeds will land alongside the existing seeds
+      0-2 so downstream aggregation treats them as the same cohort; seed
+      numbering (3-9) prevents any accidental overwrite.
 """
 
 import stat
@@ -108,7 +110,7 @@ COMMON_ARGS = {
     "l2_lambda": "5e-3",
     "init_seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "paper-lipschitz-label1-cifar-extra",
+    "wandb_project": "paper-lipschitz-estimator",
 }
 
 # Extra args only for the Lipschitz online entry. rho_lr now lives in
