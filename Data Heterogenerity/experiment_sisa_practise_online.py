@@ -122,14 +122,15 @@ def online_convex_bal_lipschitz_update_u(
     u_min=-20.0,
     u_max=20.0,
     eps=1e-12,
+    lipschitz_floor_alpha=1.0,
 ):
     """
     Residual-balance online update on u = log(sigma) with a HARD Lipschitz
-    projection enforcing sigma >= L_hat:
+    projection enforcing sigma >= alpha * L_hat:
 
-        u_raw = u - eta_u * grad_res(u)                      # OGD step on 0.5*(u - tau)^2
-        u_new = max(u_raw, log(L_hat))                        # hard projection
-        u_new = clamp(u_new, u_min, u_max)                    # global bounds
+        u_raw = u - eta_u * grad_res(u)                       # OGD step on 0.5*(u - tau)^2
+        u_new = max(u_raw, log(alpha) + log(L_hat))            # hard projection
+        u_new = clamp(u_new, u_min, u_max)                     # global bounds
 
     DESIGN NOTE (2026-04-19): this replaces an earlier soft quadratic floor
     parameterized by lambda_L. Empirically we found lambda_L needed to be
@@ -140,7 +141,18 @@ def online_convex_bal_lipschitz_update_u(
     descent guarantee (only needs sigma_k >= L_hat_k, which hard projection
     enforces exactly). See adaptive_sigma_lipschitz_proof.tex.
 
-    Floor is inactive (u_new == u_raw) when u_raw >= log(L_hat), i.e. in the
+    CHANGE LOG (2026-04-24): added `lipschitz_floor_alpha` parameter. With
+    alpha=1.0 (default) the behavior is identical to the original hard
+    projection. With alpha<1 the floor is relaxed proportionally in log
+    space (log_floor = log(L_hat) + log(alpha)), letting sigma drop below
+    exp(L_hat). Motivated by cifar10 label3: BB-estimated L_hat is 10x
+    larger than the productive sigma range (~10^3) on simple-cnn/cifar10,
+    so the hard floor over-regularizes. Relaxing to alpha<1 expands the
+    feasible set; mnist/fmnist behavior is expected to be unchanged
+    (floor was rarely binding there) but must be verified empirically
+    before folding this into the main theorem.
+
+    Floor is inactive (u_new == u_raw) when u_raw >= log_floor, i.e. in the
     exact-ADMM regime where the penalty already dominates Lipschitz.
     """
     r_clip = torch.clamp(primal_res, min=eps)
@@ -149,6 +161,8 @@ def online_convex_bal_lipschitz_update_u(
 
     target = torch.log(r_clip) - torch.log(dy_clip)
     log_L = torch.log(L_clip)
+    # Shift the floor by log(alpha); alpha=1 reproduces hard projection.
+    log_floor = log_L + math.log(max(lipschitz_floor_alpha, eps))
 
     diff = u - target
     res_loss = diff.pow(2)
@@ -157,8 +171,8 @@ def online_convex_bal_lipschitz_update_u(
 
     with torch.no_grad():
         u_raw = u - eta_u * grad_u
-        floor_active = (u_raw < log_L).to(log_L.dtype)
-        u_new = torch.maximum(u_raw, log_L)
+        floor_active = (u_raw < log_floor).to(log_floor.dtype)
+        u_new = torch.maximum(u_raw, log_floor)
         u_new = torch.clamp(u_new, min=u_min, max=u_max)
 
     return (
@@ -475,6 +489,15 @@ def get_args():
                              'smaller deltas are skipped to avoid noise amplification')
     parser.add_argument('--lipschitz_max', type=float, default=1e8,
                         help='clip for the raw BB Lipschitz estimate per round')
+    parser.add_argument('--lipschitz_floor_alpha', type=float, default=1.0,
+                        help='Scale factor on the hard Lipschitz projection floor: '
+                             'enforces sigma >= alpha * exp(L_hat) instead of '
+                             'sigma >= exp(L_hat). alpha=1.0 reproduces the original '
+                             'hard projection; alpha<1.0 relaxes the floor (motivated '
+                             'by cifar10 where BB L_hat over-regularizes sigma). Must '
+                             'be a universal constant across experiments to preserve '
+                             'the parameter-free property. See online_convex_bal_lipschitz_update_u '
+                             'docstring for the 2026-04-24 design note.')
 
     # numerical stability
     parser.add_argument('--eps', type=float, default=1e-8,
@@ -1846,6 +1869,7 @@ if __name__ == '__main__':
                         u_min=math.log(sigma_min),
                         u_max=math.log(sigma_max),
                         eps=getattr(args, "eps", 1e-12),
+                        lipschitz_floor_alpha=getattr(args, "lipschitz_floor_alpha", 1.0),
                     )
                     u_sigma = u_new
                     sigma_lr = float(torch.exp(u_new).item())
