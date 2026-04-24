@@ -1751,6 +1751,23 @@ if __name__ == '__main__':
                         else:
                             med = sorted_buf[n // 2]
                         L_hat_tensor = torch.tensor(med, device=device)
+                    elif lipschitz_estimator == "ema_per_layer_median":
+                        # Diagnostic mode: use the median over per-layer L̂ EMAs as
+                        # the scalar floor (instead of the global-norm L̂). Tests
+                        # whether the scalar floor is being pulled up by a single
+                        # outlier layer — if swapping median for global-norm fixes
+                        # the cell, per-layer sigma is the right direction.
+                        _nonzero_pl = [v for v in L_hat_ema_per_layer if v > 0]
+                        if _nonzero_pl:
+                            _sorted_pl = sorted(_nonzero_pl)
+                            _n = len(_sorted_pl)
+                            if _n % 2 == 0:
+                                _med_pl = 0.5 * (_sorted_pl[_n // 2 - 1] + _sorted_pl[_n // 2])
+                            else:
+                                _med_pl = _sorted_pl[_n // 2]
+                            L_hat_tensor = torch.tensor(_med_pl, device=device)
+                        else:
+                            L_hat_tensor = torch.tensor(0.0, device=device)
                     else:
                         L_hat_tensor = torch.tensor(0.0, device=device)
 
