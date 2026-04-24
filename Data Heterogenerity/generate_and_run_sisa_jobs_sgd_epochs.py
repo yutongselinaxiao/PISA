@@ -1,3 +1,22 @@
+"""Generator for exact-ADMM SGD sweeps.
+
+CHANGE LOG
+- 2026-04-24: Added cifar10 x {label1, label2, label3} cases. Motivation:
+  the Lipschitz-floor path plateaus at ~0.21 on cifar10 simple-cnn while
+  tuned SISA reaches ~0.40, so we need to test whether the exact-ADMM
+  adaptive-sigma path (which has NO Lipschitz floor, just online_convex_bal)
+  works on cifar10. Three outcomes possible:
+    - exact-ADMM SGD convex-bal matches SISA on cifar10 -> Lipschitz floor
+      is the specific cifar10 culprit; paper keeps the adaptive-sigma claim
+      and frames the floor as an optional refinement.
+    - exact-ADMM SGD convex-bal also caps at ~0.21 -> scalar adaptive sigma
+      itself doesn't scale to cifar10, not just the floor.
+    - Mixed / bimodal -> needs more investigation.
+  The mnist/fmnist cases are commented out in this revision so only the new
+  cifar10 cells launch this run (no duplicates in the wandb project).
+  Uncomment to include mnist/fmnist in a future full sweep.
+"""
+
 import stat
 import subprocess
 import threading
@@ -77,7 +96,7 @@ ORIGINAL_COMMON_ARGS = {
     "comm_round": "500",
     "beta": "0.5",
     "device": "cuda:0",
-    "datadir": "/data/yutong/datasets",
+    "datadir": "/dataMeR2/yutong/datasets",
     "logdir": "./logs/",
     "noise": "0",
     "sample": "1",
@@ -100,14 +119,21 @@ ADAPTIVE_EXTRA_ARGS = {
     "sigma_ema_beta": "0.9",
 }
 
-# Start small; expand later
+# 2026-04-24: cifar10 cases added; mnist/fmnist commented out to avoid
+# duplicating existing finished runs in the wandb project. Uncomment to
+# include them in a full sweep.
 CASES = [
-    {"case_name": "mnist_label3_n10", "dataset": "mnist", "partition": "noniid-#label3", "model": "simple-cnn"},
-    {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
-    {"case_name": "mnist_label2_n10", "dataset": "mnist", "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "mnist_label1_n10", "dataset": "mnist", "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
+    # --- mnist / fmnist (already run; leave commented out unless re-sweeping) ---
+    # {"case_name": "mnist_label3_n10", "dataset": "mnist", "partition": "noniid-#label3", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
+    # {"case_name": "mnist_label2_n10", "dataset": "mnist", "partition": "noniid-#label2", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
+    # {"case_name": "mnist_label1_n10", "dataset": "mnist", "partition": "noniid-#label1", "model": "simple-cnn"},
+    # {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
+    # --- cifar10 cases (new in 2026-04-24 change) ---
+    {"case_name": "cifar10_label1_n10", "dataset": "cifar10", "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "cifar10_label2_n10", "dataset": "cifar10", "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "cifar10_label3_n10", "dataset": "cifar10", "partition": "noniid-#label3", "model": "simple-cnn"},
 ]
 
 # Original SISA-ADMM baseline (no sigma_mode logic). Uses experiment_sisa_practise_wandb.py.
