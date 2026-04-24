@@ -39,13 +39,16 @@ CHANGE LOG
   JOB_SPEC "lipschitz_label1_extra":
     * method: online_convex_bal_lipschitz + eta_u_decay=textbook_sc
       (experiment_sisa_practise_online.py)
-    * cases: {mnist, fmnist, cifar10} x label1
+    * cases: {mnist, fmnist} x label1
+      (cifar10_label1 intentionally excluded: its existing Lipschitz
+      seeds 0-2 are already symmetric with the fresh cifar10 baseline
+      seeds 0-2 from the other spec.)
     * seeds: [3, 4, 5, 6, 7, 8, 9]  -- 7 extra on top of existing 0-2
       to reach n=10 unique seeds per cell.
     * sigma0: {1e2, 1e3, 1e4}
-    * jobs: 3 datasets x 3 sigma x 7 seeds = 63 runs.
+    * jobs: 2 datasets x 3 sigma x 7 seeds = 42 runs.
 
-  Grand total: 90 runs. Launched with 1 seed per script, 8 GPUs x 8 concurrent
+  Grand total: 69 runs. Launched with 1 seed per script, 8 GPUs x 8 concurrent
   = 64 workers (pattern from generate_and_run_sisa_jobs_sgd_epochs.py).
 
   Other changes:
@@ -151,12 +154,14 @@ JOB_SPECS = [
         "spec_id": "lipschitz_label1_extra",
         "entry": ONLINE_ENTRY,
         "extra_args": LIPSCHITZ_EXTRA_ARGS,
+        # cifar10_label1 omitted for now: its existing Lipschitz seeds (0-2)
+        # will be compared against the fresh cifar10 baseline seeds (0-2)
+        # produced by the other spec, so that cell is already symmetric.
+        # Add cifar10_label1 here later if extra seeds are wanted on top.
         "cases": [
             {"case_name": "mnist_label1_n10", "dataset": "mnist",
              "partition": "noniid-#label1", "model": "simple-cnn"},
             {"case_name": "fmnist_label1_n10", "dataset": "fmnist",
-             "partition": "noniid-#label1", "model": "simple-cnn"},
-            {"case_name": "cifar10_label1_n10", "dataset": "cifar10",
              "partition": "noniid-#label1", "model": "simple-cnn"},
         ],
         "seeds": [3, 4, 5, 6, 7, 8, 9],
