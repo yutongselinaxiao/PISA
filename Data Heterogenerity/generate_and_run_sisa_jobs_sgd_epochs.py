@@ -5,16 +5,18 @@ CHANGE LOG
   the Lipschitz-floor path plateaus at ~0.21 on cifar10 simple-cnn while
   tuned SISA reaches ~0.40, so we need to test whether the exact-ADMM
   adaptive-sigma path (which has NO Lipschitz floor, just online_convex_bal)
-  works on cifar10. Three outcomes possible:
-    - exact-ADMM SGD convex-bal matches SISA on cifar10 -> Lipschitz floor
-      is the specific cifar10 culprit; paper keeps the adaptive-sigma claim
-      and frames the floor as an optional refinement.
-    - exact-ADMM SGD convex-bal also caps at ~0.21 -> scalar adaptive sigma
-      itself doesn't scale to cifar10, not just the floor.
-    - Mixed / bimodal -> needs more investigation.
-  The mnist/fmnist cases are commented out in this revision so only the new
-  cifar10 cells launch this run (no duplicates in the wandb project).
-  Uncomment to include mnist/fmnist in a future full sweep.
+  works on cifar10.
+- 2026-04-24 (later): switched experiment_sisa_practise_admm.py's local solve
+  to WARM-START from w_i^{k-1} (the previous local solution) instead of
+  resetting to w_global^k each round. The caller already prepared the model
+  with W_b_initial[sb]; the inner reset that killed the warm-start was
+  removed. See the function docstring of `local_admm_train` in
+  experiment_sisa_practise_admm.py for the design note.
+  Re-running the full sweep with the new behavior in a fresh wandb project
+  (`sisa-exact-admm-warmstart`) to keep results clean and comparable to the
+  pre-warm-start runs in `sisa-exact-admm-sgd-epochs-4-22`. mnist/fmnist
+  cases are uncommented because the warm-start might shift their numbers
+  too -- need the full grid to validate / characterize the change.
 """
 
 import stat
@@ -23,7 +25,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-OUTPUT_DIR = Path("generated_sisa_sgd_epochs_runs_4_22")
+OUTPUT_DIR = Path("generated_sisa_exact_admm_warmstart")
 LOG_DIR = OUTPUT_DIR / "logs"
 # LOCAL_METRICS_DIR = OUTPUT_DIR / "local_metrics"
 
@@ -35,18 +37,24 @@ SEEDS = [0, 1, 2]
 
 # Extra seeds to run ONLY on the headline cells, to get tight CIs on the
 # fmnist-label3-beats-SISA claim. Key tuple: (case, method, sigma_lr, epochs, lr).
+# 2026-04-24 (later): commented out for the warm-start sweep -- we want a
+# clean 3-seed grid first, then add headline extras only after the warm-start
+# results are evaluated. Restore by uncommenting below.
 EXTRA_SEEDS = [3, 4, 5, 6, 7, 8, 9]
-HEADLINE_CELLS = {
-    ("mnist_label3_n10",  "sgd_adaptive", "1e4", "3", "0.001"),
-    ("fmnist_label3_n10", "sgd_adaptive", "1e4", "3", "0.001"),
-    ("mnist_label3_n10",  "sgd_original", "1e3", "1", "0.001"),
-    ("fmnist_label3_n10", "sgd_original", "1e3", "1", "0.001"),
-}
+HEADLINE_CELLS = set()
+# HEADLINE_CELLS = {
+#     ("mnist_label3_n10",  "sgd_adaptive", "1e4", "3", "0.001"),
+#     ("fmnist_label3_n10", "sgd_adaptive", "1e4", "3", "0.001"),
+#     ("mnist_label3_n10",  "sgd_original", "1e3", "1", "0.001"),
+#     ("fmnist_label3_n10", "sgd_original", "1e3", "1", "0.001"),
+# }
 
-# Concurrent runs per physical GPU. On H100 80GB, simple-cnn/batch-64 uses
-# ~1GB VRAM and a small fraction of SMs per process, so 8 fits comfortably.
-# Watch `nvidia-smi` — if SM util caps below ~70% per GPU, bump to 10-12.
-MAX_PARALLEL_PER_GPU = 8
+# Concurrent runs per physical GPU. simple-cnn batch=64 uses ~1-2GB VRAM
+# and a tiny fraction of H100 SMs per process. At 16/GPU we put ~32GB on
+# each (out of 80GB), CUDA contexts ~6.4GB; comfortable. With 128 workers
+# total across 8 GPUs, 352 jobs finish in ~3 waves vs ~5.5 at 8/GPU.
+# Drop to 12 or 8 if `nvidia-smi` shows OOM or job startup contention.
+MAX_PARALLEL_PER_GPU = 16
 
 # Sweep over initial sigma
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
@@ -79,7 +87,7 @@ COMMON_ARGS = {
     "init_seed": "${seed}",
     "optimizer": "sgd",
     "use_wandb": "true",
-    "wandb_project": "sisa-exact-admm-sgd-epochs-4-22",
+    "wandb_project": "sisa-exact-admm-warmstart",
     # "local_log_dir": str(LOCAL_METRICS_DIR),
 }
 
@@ -105,7 +113,7 @@ ORIGINAL_COMMON_ARGS = {
     "l2_lambda": "5e-3",
     "init_seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "sisa-exact-admm-sgd-epochs-4-22",
+    "wandb_project": "sisa-exact-admm-warmstart",
 }
 
 ADAPTIVE_EXTRA_ARGS = {
@@ -119,21 +127,20 @@ ADAPTIVE_EXTRA_ARGS = {
     "sigma_ema_beta": "0.9",
 }
 
-# 2026-04-24: cifar10 cases added; mnist/fmnist commented out to avoid
-# duplicating existing finished runs in the wandb project. Uncomment to
-# include them in a full sweep.
+# 2026-04-24 (later): full sweep on mnist + fmnist + cifar10 enabled because
+# the local-solve warm-start change could shift mnist/fmnist numbers too.
+# Going to a fresh wandb_project so old (reset-to-w_global) and new
+# (warm-start) results don't get mixed up.
 CASES = [
-    # --- mnist / fmnist (already run; leave commented out unless re-sweeping) ---
-    # {"case_name": "mnist_label3_n10", "dataset": "mnist", "partition": "noniid-#label3", "model": "simple-cnn"},
-    # {"case_name": "fmnist_label3_n10", "dataset": "fmnist", "partition": "noniid-#label3", "model": "simple-cnn"},
-    # {"case_name": "mnist_label2_n10", "dataset": "mnist", "partition": "noniid-#label2", "model": "simple-cnn"},
-    # {"case_name": "fmnist_label2_n10", "dataset": "fmnist", "partition": "noniid-#label2", "model": "simple-cnn"},
-    # {"case_name": "mnist_label1_n10", "dataset": "mnist", "partition": "noniid-#label1", "model": "simple-cnn"},
-    # {"case_name": "fmnist_label1_n10", "dataset": "fmnist", "partition": "noniid-#label1", "model": "simple-cnn"},
-    # --- cifar10 cases (new in 2026-04-24 change) ---
-    {"case_name": "cifar10_label1_n10", "dataset": "cifar10", "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "cifar10_label2_n10", "dataset": "cifar10", "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "cifar10_label3_n10", "dataset": "cifar10", "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "mnist_label3_n10",  "dataset": "mnist",   "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "fmnist_label3_n10", "dataset": "fmnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "mnist_label2_n10",  "dataset": "mnist",   "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "fmnist_label2_n10", "dataset": "fmnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "mnist_label1_n10",  "dataset": "mnist",   "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "fmnist_label1_n10", "dataset": "fmnist",  "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "cifar10_label1_n10","dataset": "cifar10", "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "cifar10_label2_n10","dataset": "cifar10", "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "cifar10_label3_n10","dataset": "cifar10", "partition": "noniid-#label3", "model": "simple-cnn"},
 ]
 
 # Original SISA-ADMM baseline (no sigma_mode logic). Uses experiment_sisa_practise_wandb.py.

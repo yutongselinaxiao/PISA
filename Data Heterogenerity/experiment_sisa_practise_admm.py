@@ -969,13 +969,31 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     (like SISA's rho * sqrt(v)) while keeping sigma as a regularization weight,
     preserving robustness to sigma initialization.
 
+    CHANGE LOG (2026-04-24): warm-start the local solve from w_i^{k-1} (the
+    previous round's local solution) instead of resetting to w_global^k.
+    The caller copies W_b_initial[sb] into the model BEFORE calling this
+    function (see ~line 1463). Previously this function then copied w_global
+    over those params, killing the warm-start. We now leave the model at
+    whatever the caller set it to, which is the warm-started w_i^{k-1}.
+
+    Why: pure ADMM theory assumes the x-subproblem is solved exactly each
+    round, so the starting point doesn't matter. Under inexact solves
+    (finite SGD epochs, nonconvex F_i), the starting point does matter --
+    warm-starting accumulates local progress across rounds. Trade-off: w_i
+    drifts further from w_global on average, making sigma the only force
+    pulling the local model back toward the global. Robustness to sigma
+    initialization is preserved by the OGD on u = log sigma. See
+    notes/lipschitz_floor_bounded_variation.tex for the descent argument
+    that still applies.
+
     Returns:
         (params, avg_loss) for sgd/adam/amsgrad
         (params, avg_loss, optimizer_state_dict) for adam_warmstart
     """
-    with torch.no_grad():
-        for p, wg in zip(model.parameters(), w_global):
-            p.copy_(wg)
+    # NOTE: do NOT reset model parameters to w_global here. The caller is
+    # expected to warm-start the model with w_i^{k-1} (the previous local
+    # solution) before invoking this function. Resetting would discard that
+    # warm-start; see the design note above.
 
     if args.optimizer == 'adam_warmstart':
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
