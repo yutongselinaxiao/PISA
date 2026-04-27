@@ -153,7 +153,25 @@ def get_args():
     parser.add_argument('--beta', type=float, default=0.5, help='The parameter for the dirichlet distribution for data partitioning')
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
-    parser.add_argument('--optimizer', type=str, default='sgd', help='the optimizer')
+    parser.add_argument('--optimizer', type=str, default='sgd',
+                        help="the optimizer: 'sgd', 'adam', 'amsgrad', 'adam_warmstart', "
+                             "'adamw_admm_explicit', or 'adamw_admm_implicit'. The two "
+                             "adamw_admm_* variants decouple the ADMM regularizer "
+                             "alpha*(pi + sigma*(w-w_g)) from Adam's m, v -- see "
+                             "notes/adam_warmstart_pseudocode.tex Algorithms 3 and 4.")
+    parser.add_argument('--local_init', type=str, default='reset',
+                        choices=['reset', 'warm'],
+                        help="How to initialize the local solve at each ADMM round: "
+                             "'reset' resets w_i to w_global^k each round (default; "
+                             "matches classical ADMM x-subproblem); 'warm' warm-starts "
+                             "from w_i^{k-1}. Empirically warm regressed 36/70 cells in "
+                             "Apr 2026 -- kept as opt-in for future work.")
+    parser.add_argument('--admm_reg_lr', type=float, default=None,
+                        help='Stepsize for the decoupled ADMM regularizer in '
+                             'adamw_admm_explicit / adamw_admm_implicit. Defaults to '
+                             '--lr if unset. For adamw_admm_explicit, choose so that '
+                             'admm_reg_lr * sigma is O(1) for stability; '
+                             'adamw_admm_implicit is unconditionally stable.')
     parser.add_argument('--mu', type=float, default=0.001, help='the mu parameter for fedprox')
     parser.add_argument('--noise', type=float, default=0, help='how much noise we add to some party')
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
@@ -964,37 +982,66 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
 
         min_wi alpha_i * F_i(wi) + <pi_i, wi - w_global> + (sigma/2)||wi - w_global||^2
 
-    When args.optimizer == 'adam_warmstart', uses Adam with warm-started optimizer
-    state across ADMM rounds. This gives per-parameter adaptive preconditioning
-    (like SISA's rho * sqrt(v)) while keeping sigma as a regularization weight,
-    preserving robustness to sigma initialization.
+    Initialization for the local solve is controlled by args.local_init:
+      - 'reset' (default): reset model params to w_global^k at the start of
+        each round. The caller's warm-start (W_b_initial[sb] copied into
+        model before this call) is overwritten. This is the original ADMM
+        x-subproblem behavior.
+      - 'warm': leave the model at whatever the caller set it to, i.e.\
+        w_i^{k-1} (the previous round's local solution). Tested but reverted
+        as default after empirical regression -- see CHANGE LOG below.
 
-    CHANGE LOG (2026-04-24): warm-start the local solve from w_i^{k-1} (the
-    previous round's local solution) instead of resetting to w_global^k.
-    The caller copies W_b_initial[sb] into the model BEFORE calling this
-    function (see ~line 1463). Previously this function then copied w_global
-    over those params, killing the warm-start. We now leave the model at
-    whatever the caller set it to, which is the warm-started w_i^{k-1}.
+    args.optimizer chooses the inner solver:
+      - 'sgd'             : plain SGD with momentum on the augmented Lagrangian.
+      - 'adam'            : Adam (fresh m, v each round) on the aug Lagrangian.
+      - 'amsgrad'         : AMSGrad variant.
+      - 'adam_warmstart'  : Adam with m, v, t persisted across rounds via
+        optimizer_state. Adam sees the FULL aug Lagrangian gradient (task +
+        dual + quadratic), so sigma's contribution to v cancels sigma out of
+        the effective step magnitude (see notes/adam_warmstart_pseudocode.tex).
+      - 'adamw_admm_explicit'  : NEW (2026-04-24, Algorithm 3 in
+        notes/adam_warmstart_pseudocode.tex). Adam updates m, v from the TASK
+        gradient ONLY; the ADMM regularizer alpha_i*(pi + sigma*(w - w_g)) is
+        applied as an explicit decoupled subtraction with stepsize
+        args.admm_reg_lr. Avoids sigma cancellation in v.
+      - 'adamw_admm_implicit'  : NEW (Algorithm 4). Same task-only Adam step
+        plus explicit dual subtraction plus implicit Tikhonov prox of the
+        quadratic (sigma/2)||w - w_g||^2. Unconditionally stable for any sigma.
 
-    Why: pure ADMM theory assumes the x-subproblem is solved exactly each
-    round, so the starting point doesn't matter. Under inexact solves
-    (finite SGD epochs, nonconvex F_i), the starting point does matter --
-    warm-starting accumulates local progress across rounds. Trade-off: w_i
-    drifts further from w_global on average, making sigma the only force
-    pulling the local model back toward the global. Robustness to sigma
-    initialization is preserved by the OGD on u = log sigma. See
-    notes/lipschitz_floor_bounded_variation.tex for the descent argument
-    that still applies.
+    CHANGE LOG (2026-04-24, REVERTED same day): briefly used local_init='warm'
+    as default, removing the inner reset-to-w_global. Empirical verdict from
+    sisa-exact-admm-warmstart vs sisa-exact-admm-sgd-epochs-4-22 (Section 9
+    of the dashboard): 36/70 paired cells regressed (mnist_label1 ep=1
+    dropped 33-44pp; fmnist_label1 ep=10 dropped 27-29pp). Only 8 cells
+    improved (narrow win on ep=10 mnist_label2/3 and fmnist_label3). Reverted
+    default to local_init='reset'. Warm-start preserved as opt-in for future
+    investigation -- the 8 improvements suggest it might help in a specific
+    regime (long local epochs on milder heterogeneity) that we have not yet
+    characterized.
+
+    AdamW-style decoupled-regularizer optimizers added 2026-04-24 to address
+    the sigma-cancellation pathology of 'adam_warmstart'. See pseudocode in
+    notes/adam_warmstart_pseudocode.tex.
 
     Returns:
         (params, avg_loss) for sgd/adam/amsgrad
-        (params, avg_loss, optimizer_state_dict) for adam_warmstart
+        (params, avg_loss, optimizer_state_dict) for adam_warmstart and the
+            two adamw_admm variants (these all carry persistent Adam state).
     """
-    # NOTE: do NOT reset model parameters to w_global here. The caller is
-    # expected to warm-start the model with w_i^{k-1} (the previous local
-    # solution) before invoking this function. Resetting would discard that
-    # warm-start; see the design note above.
+    # ----- Initialization: reset (default) or warm-start (opt-in) -----
+    local_init = getattr(args, "local_init", "reset")
+    if local_init == "reset":
+        with torch.no_grad():
+            for p, wg in zip(model.parameters(), w_global):
+                p.copy_(wg)
+    elif local_init == "warm":
+        # Caller is expected to have copied W_b_initial[sb] into model.
+        # Leave parameters as-is.
+        pass
+    else:
+        raise ValueError(f"Unknown local_init: {local_init!r}; expected 'reset' or 'warm'.")
 
+    # ----- Optimizer dispatch -----
     if args.optimizer == 'adam_warmstart':
         optimizer = optim.Adam(model.parameters(), lr=args.lr)
         if optimizer_state is not None:
@@ -1005,6 +1052,13 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg, amsgrad=True)
     elif args.optimizer == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.rho, weight_decay=args.reg)
+    elif args.optimizer in ('adamw_admm_explicit', 'adamw_admm_implicit'):
+        # Adam with persistent state (m, v, t) across rounds, but updated from
+        # the TASK gradient only. The ADMM regularizer is applied outside the
+        # optimizer step in the inner loop below.
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
     else:
         raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
@@ -1013,44 +1067,73 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
 
     epoch_loss = 0.0
     n_batches = 0
+    # decoupled regularizer stepsize; default to args.lr if --admm_reg_lr unset.
+    eta_r = getattr(args, "admm_reg_lr", None)
+    if eta_r is None:
+        eta_r = args.lr
+    decoupled = args.optimizer in ('adamw_admm_explicit', 'adamw_admm_implicit')
 
     for _ in range(args.epochs):
         for x, target in train_dl_local:
             x, target = x.to(device), target.to(device).long()
 
-            # Reset model params to w_global before EACH batch so every SGD
-            # step starts from the anchor (Option A: fresh-start SGD).
-            # with torch.no_grad():
-            #     for p, wg in zip(model.parameters(), w_global):
-            #         p.copy_(wg)
-
             optimizer.zero_grad()
             out = model(x)
             task_loss = criterion(out, target)
 
-            dual_term = 0.0
-            quad_term = 0.0
-            for p, wg, pi in zip(model.parameters(), w_global, pi_local):
-                diff = p - wg
-                dual_term = dual_term + torch.sum(pi * diff)
-                quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
+            if decoupled:
+                # ----- AdamW-style decoupled inner loop -----
+                # 1) Adam sees only the task gradient (alpha_i scales the loss
+                #    so the gradient = alpha_i * grad F_i).
+                (alpha_i * task_loss).backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()  # m, v updated from task grad; w receives Adam step
 
-            # --- Alpha on whole augmented Lagrangian term ---
-            # loss = alpha_i * (F_i + <pi, w-w_g> + sigma/2 ||w-w_g||^2)
-            loss = alpha_i * (task_loss + dual_term + quad_term)
-            # --- [COMMENTED OUT] Alpha only on F_i ---
-            # loss = alpha_i * task_loss + dual_term + quad_term
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            optimizer.step()
+                # 2) Apply ADMM regularizer alpha_i*(pi + sigma*(w-w_g)) as a
+                #    decoupled, no-grad parameter update.
+                with torch.no_grad():
+                    if args.optimizer == 'adamw_admm_explicit':
+                        # Explicit: w <- w - eta_r * alpha_i * (pi + sigma*(w - w_g))
+                        for p, wg, pi in zip(model.parameters(), w_global, pi_local):
+                            p.add_(-eta_r * alpha_i * (pi + sigma_lr * (p - wg)))
+                    else:  # adamw_admm_implicit
+                        # Step on pi explicitly; quadratic via implicit Tikhonov prox:
+                        #   p_new = (p - eta_r*alpha*pi + eta_r*alpha*sigma*w_g) / (1 + eta_r*alpha*sigma)
+                        denom = 1.0 + eta_r * alpha_i * sigma_lr
+                        for p, wg, pi in zip(model.parameters(), w_global, pi_local):
+                            p.add_(-eta_r * alpha_i * pi)              # explicit dual
+                            p.add_(eta_r * alpha_i * sigma_lr * wg)    # numerator: + eta_r*alpha*sigma*w_g
+                            p.div_(denom)                              # implicit prox
 
-            epoch_loss += loss.item()
+                # Loss tracking (full augmented Lagrangian for logging, no grad).
+                with torch.no_grad():
+                    dual_t = sum(torch.sum(pi * (p - wg)) for p, wg, pi in zip(model.parameters(), w_global, pi_local))
+                    quad_t = sum(0.5 * sigma_lr * torch.sum((p - wg) ** 2) for p, wg in zip(model.parameters(), w_global))
+                    full_loss = alpha_i * (task_loss + dual_t + quad_t)
+                epoch_loss += float(full_loss.item())
+
+            else:
+                # ----- Original behavior: full augmented-Lagrangian gradient -----
+                dual_term = 0.0
+                quad_term = 0.0
+                for p, wg, pi in zip(model.parameters(), w_global, pi_local):
+                    diff = p - wg
+                    dual_term = dual_term + torch.sum(pi * diff)
+                    quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
+
+                # alpha_i scales the whole augmented Lagrangian.
+                loss = alpha_i * (task_loss + dual_term + quad_term)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
     params = [p.detach().clone() for p in model.parameters()]
 
-    if args.optimizer == 'adam_warmstart':
+    if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit', 'adamw_admm_implicit'):
         return params, avg_loss, optimizer.state_dict()
     return params, avg_loss
 
@@ -1515,7 +1598,7 @@ if __name__ == '__main__':
                     optimizer_state=optimizer_states[sb]
                 )
 
-                if args.optimizer == 'adam_warmstart':
+                if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit', 'adamw_admm_implicit'):
                     W_i_new, avg_local_loss, optimizer_states[sb] = result
                 else:
                     W_i_new, avg_local_loss = result

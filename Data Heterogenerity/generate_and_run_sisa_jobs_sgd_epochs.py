@@ -50,11 +50,13 @@ HEADLINE_CELLS = set()
 # }
 
 # Concurrent runs per physical GPU. simple-cnn batch=64 uses ~1-2GB VRAM
-# and a tiny fraction of H100 SMs per process. At 16/GPU we put ~32GB on
-# each (out of 80GB), CUDA contexts ~6.4GB; comfortable. With 128 workers
-# total across 8 GPUs, 352 jobs finish in ~3 waves vs ~5.5 at 8/GPU.
-# Drop to 12 or 8 if `nvidia-smi` shows OOM or job startup contention.
-MAX_PARALLEL_PER_GPU = 16
+# and a tiny fraction of H100 SMs per process. 16/GPU was tried and
+# produced occasional crashes/failures (likely CPU oversubscription, wandb
+# init contention, or disk I/O on simultaneous dataset loads, not GPU
+# memory). 8/GPU is the safe default; 64 workers across 8 GPUs gives
+# ~5 waves at T=500. Bump back to 12-16 if you confirm runs are stable
+# and want faster wall-time.
+MAX_PARALLEL_PER_GPU = 8
 
 # Sweep over initial sigma
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
