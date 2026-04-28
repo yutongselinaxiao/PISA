@@ -87,6 +87,7 @@ COMMON_ARGS = {
     "lipschitz_min_dz": "1e-6",
     "lipschitz_max": "1e10",
     "device": "cuda:0",
+    "datadir": "/dataMeR2/yutong/datasets",
     # plumbed via shell template substitution
     "sigma_lr": "${sigma_lr}",
     "seed": "${seed}",

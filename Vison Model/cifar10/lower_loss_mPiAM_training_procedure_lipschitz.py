@@ -105,6 +105,8 @@ def get_parser():
     parser.add_argument('--weight_decay', default=5e-4, type=float)
     parser.add_argument('--reset', action='store_true')
     parser.add_argument('--device', default='cuda:0', type=str)
+    parser.add_argument('--datadir', default='./data', type=str,
+                        help='root for torchvision CIFAR10 (matches FL entry convention)')
     parser.add_argument('--seed', default=42, type=int,
                         help='global RNG seed (random/numpy/torch)')
 
@@ -166,11 +168,11 @@ def build_dataset(args):
         transforms.ToTensor(),
         transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
     ])
-    trainset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True,
+    trainset = torchvision.datasets.CIFAR10(root=args.datadir, train=True, download=True,
                                             transform=transform_train)
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batchsize,
                                                shuffle=True, num_workers=2)
-    testset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True,
+    testset = torchvision.datasets.CIFAR10(root=args.datadir, train=False, download=True,
                                            transform=transform_test)
     test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batchsize,
                                               shuffle=False, num_workers=2)
