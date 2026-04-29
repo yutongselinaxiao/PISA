@@ -169,6 +169,10 @@ def get_parser():
                         help='residual ratio threshold for heuristic mode')
     parser.add_argument('--heuristic_tau', type=float, default=2.0,
                         help='multiplicative factor for heuristic mode')
+    parser.add_argument('--dead_band_mu', type=float, default=1.0,
+                        help='OGD trust-region threshold: skip σ-update when '
+                             '|log(r/s)| < log(dead_band_mu). 1.0 = disabled '
+                             '(always update). 10.0 matches heuristic\'s μ.')
     parser.add_argument('--sigma_min', type=float, default=1e-6)
     parser.add_argument('--sigma_max', type=float, default=1e6)
     parser.add_argument('--eta_u', type=float, default=0.05,
@@ -390,6 +394,7 @@ def main():
             mode=ogd_mode,
             heuristic_mu=args.heuristic_mu,
             heuristic_tau=args.heuristic_tau,
+            dead_band_mu=args.dead_band_mu,
         )
         sigma_lr_current = args.sigma_lr
         rho_lr_current = args.rho_lr

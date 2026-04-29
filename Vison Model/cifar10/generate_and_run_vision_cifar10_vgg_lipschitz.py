@@ -163,6 +163,19 @@ TRUE_BAL_CONSERVATIVE_EXTRA_ARGS = {
     "G_clip": "1.0",
 }
 
+# Conservative + dead-band on |log(r/s)|. dead_band_mu=10 mirrors the
+# heuristic's μ-threshold: when residuals are within an order of magnitude,
+# skip the σ-update entirely. Inside the dead-band σ stays put (heuristic-like);
+# outside, OGD updates continuously. Closes the gap between OGD and heuristic
+# on ill-conditioned problems while preserving OGD's continuous theory off-band.
+TRUE_BAL_DEAD_BAND_EXTRA_ARGS = {
+    "sigma_mode": "online_true_bal",
+    "eta_u": "0.05",
+    "eta_u_decay": "none",
+    "G_clip": "1.0",
+    "dead_band_mu": "10.0",
+}
+
 HEURISTIC_EXTRA_ARGS = {
     "sigma_mode": "heuristic",
     "heuristic_mu": "10.0",
@@ -193,6 +206,11 @@ JOB_SPECS = [
         "spec_id": "true_bal_conservative",
         "extra_args": TRUE_BAL_CONSERVATIVE_EXTRA_ARGS,
         "tag": lambda sigma_lr: f"true_bal_constant_etau0p05_Gclip1_sig{sigma_lr}",
+    },
+    {
+        "spec_id": "true_bal_dead_band",
+        "extra_args": TRUE_BAL_DEAD_BAND_EXTRA_ARGS,
+        "tag": lambda sigma_lr: f"true_bal_deadband_mu10_sig{sigma_lr}",
     },
     # {
     #     "spec_id": "convex_bal_no_floor",
