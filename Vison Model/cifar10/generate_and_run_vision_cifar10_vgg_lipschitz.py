@@ -19,13 +19,20 @@ with the σ-OGD + Lipschitz floor machinery wired in. Fixed-mode runs in this
 sweep should reproduce the paper's VGG-11 setup; the OGD-mode rows replace
 only the σ schedule.
 
-Four methods per cell, all writing to `paper-lipschitz-vision-cifar10-vgg`:
+Five methods per cell (convex_bal_no_floor commented out as it failed
+catastrophically on VGG — see notes), all writing to
+`paper-lipschitz-vision-cifar10-vgg`:
   - Original PISA fixed-σ schedule         (--sigma_mode fixed)
   - Boyd residual-balance heuristic         (--sigma_mode heuristic)
-  - OGD on σ, no Lipschitz floor           (--sigma_mode online_convex_bal)
-  - OGD on σ + BB Lipschitz floor          (--sigma_mode online_convex_bal_lipschitz)
+  - OGD with Lipschitz floor (legacy Δy)    (--sigma_mode online_convex_bal_lipschitz)
+  - OGD with canonical s=σ·‖Δw_g‖, no floor (--sigma_mode online_true_bal)
+  - OGD with canonical s + Lipschitz floor  (--sigma_mode online_true_bal_lipschitz)
 
-σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 4 methods = 48 runs.
+σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 5 methods = 60 runs.
+
+The two `online_true_bal*` rows are the headline test of whether the
+σ-coupled dual residual fixes the OGD failure that the Δy proxy showed
+on VGG. See benchmark_ogd.tex §"VGG: σ-rule failure modes".
 
 Lipschitz config (changed from the earlier ema-estimator runs that all
 collapsed):
@@ -122,6 +129,21 @@ CONVEX_BAL_NO_FLOOR_EXTRA_ARGS = {
     "eta_u_decay": ETA_U_DECAY,
 }
 
+# OGD on (u-log(r/s))² with the canonical Boyd dual residual s=σ·‖Δw_g‖.
+# The σ-factor in s gives a self-balancing fixed point; missing in
+# online_convex_bal where Δy loses σ-coupling under ρ·√v dominance.
+TRUE_BAL_EXTRA_ARGS = {
+    "sigma_mode": "online_true_bal",
+    "eta_u": "0.05",
+    "eta_u_decay": ETA_U_DECAY,
+}
+
+TRUE_BAL_LIPSCHITZ_EXTRA_ARGS = {
+    "sigma_mode": "online_true_bal_lipschitz",
+    "eta_u": "0.05",
+    "eta_u_decay": ETA_U_DECAY,
+}
+
 HEURISTIC_EXTRA_ARGS = {
     "sigma_mode": "heuristic",
     "heuristic_mu": "10.0",
@@ -137,6 +159,16 @@ JOB_SPECS = [
         "spec_id": "lipschitz_textbook_sc",
         "extra_args": LIPSCHITZ_EXTRA_ARGS,
         "tag": lambda sigma_lr: f"lipschitz_decay{ETA_U_DECAY}_sig{sigma_lr}",
+    },
+    {
+        "spec_id": "true_bal",
+        "extra_args": TRUE_BAL_EXTRA_ARGS,
+        "tag": lambda sigma_lr: f"true_bal_decay{ETA_U_DECAY}_sig{sigma_lr}",
+    },
+    {
+        "spec_id": "true_bal_lipschitz",
+        "extra_args": TRUE_BAL_LIPSCHITZ_EXTRA_ARGS,
+        "tag": lambda sigma_lr: f"true_bal_lipschitz_decay{ETA_U_DECAY}_sig{sigma_lr}",
     },
     # {
     #     "spec_id": "convex_bal_no_floor",

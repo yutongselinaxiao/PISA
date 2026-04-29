@@ -155,15 +155,16 @@ def get_parser():
     # Adaptive σ (Lipschitz-floored OGD)
     parser.add_argument('--sigma_mode', type=str, default='fixed',
                         choices=['fixed', 'heuristic', 'online_convex_bal',
-                                 'online_convex_bal_lipschitz'],
+                                 'online_convex_bal_lipschitz',
+                                 'online_true_bal', 'online_true_bal_lipschitz'],
                         help='fixed = original lr-coupled schedule; '
-                             'heuristic = Boyd residual-balance multiplicative rule '
-                             '(σ *= τ when primal_res > μ·dual_res, σ /= τ when '
-                             'dual_res > μ·primal_res); '
-                             'online_convex_bal = OGD on u=log(σ) bounded only '
-                             'by [sigma_min, sigma_max] (no Lipschitz floor); '
-                             'online_convex_bal_lipschitz = same OGD plus a hard '
-                             'σ ≥ α·exp(L̂) floor from the BB Lipschitz estimator')
+                             'heuristic = Boyd multiplicative on r vs s = σ·‖Δw_g‖; '
+                             'online_convex_bal = OGD on (u-log(r/Δy))² (legacy proxy); '
+                             'online_convex_bal_lipschitz = same + Lipschitz floor; '
+                             'online_true_bal = OGD on (u-log(r/s))² with the canonical '
+                             'Boyd dual residual s=σ·‖Δw_g‖ — recommended when ρ·√v '
+                             'dominates the local solver; '
+                             'online_true_bal_lipschitz = same + Lipschitz floor.')
     parser.add_argument('--heuristic_mu', type=float, default=10.0,
                         help='residual ratio threshold for heuristic mode')
     parser.add_argument('--heuristic_tau', type=float, default=2.0,
@@ -356,16 +357,19 @@ def main():
     floor = None
     last_floor_metrics = {}
     if args.sigma_mode in (
-        'online_convex_bal_lipschitz', 'online_convex_bal', 'heuristic'
+        'online_convex_bal_lipschitz', 'online_convex_bal', 'heuristic',
+        'online_true_bal', 'online_true_bal_lipschitz',
     ):
         ogd_mode = {
             'online_convex_bal_lipschitz': 'lipschitz',
             'online_convex_bal': 'no_floor',
             'heuristic': 'heuristic',
+            'online_true_bal': 'true_bal',
+            'online_true_bal_lipschitz': 'true_bal_lipschitz',
         }[args.sigma_mode]
         param_names = (
             [n for n, _ in model.named_parameters()]
-            if ogd_mode == 'lipschitz' else None
+            if ogd_mode in ('lipschitz', 'true_bal_lipschitz') else None
         )
         floor = LipschitzFloorOGD(
             sigma_init=args.sigma_lr,
