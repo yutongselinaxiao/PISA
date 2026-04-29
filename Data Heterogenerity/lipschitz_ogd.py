@@ -12,10 +12,18 @@ What's exported:
 - `online_convex_bal_lipschitz_update_u`: pure-functional OGD step on
   u=log(σ) with hard floor σ ≥ α·exp(L̂).
 - `online_convex_bal_update_u`: same OGD step WITHOUT the Lipschitz floor;
-  σ is bounded only by [u_min, u_max]. Mirrors the original `online_convex_bal`
-  mode from the FL entry — the σ_min you pass acts as SISA's user-chosen lower
-  bound (SISA itself has no explicit floor; its schedules just never decrease
-  σ, so its effective lower bound is σ_0).
+  σ is bounded only by [u_min, u_max]. The function takes a `delta_y`
+  argument used as the "dual proxy" in the residual-balance target
+  τ = log(primal_res / delta_y). The same function serves two modes:
+    * `online_convex_bal` (legacy): caller passes Δy = ‖w_i^{k+1}-w_i^k‖
+      (local change). σ-coupling is lost when ρ·√v dominates the local
+      step, so OGD has no fixed point in that regime — see VGG failure
+      analysis in benchmark_ogd.tex §"VGG: σ-rule failure modes".
+    * `online_true_bal`: caller passes the canonical Boyd dual residual
+      s = σ·‖w_g^{k+1}-w_g^k‖. The σ-factor in s gives a self-balancing
+      fixed point — when σ rises, s rises, equilibrium r ≈ s achievable.
+      Recommended for ill-conditioned problems where the inner solver's
+      preconditioner term ρ·√v swamps σ.
 - `heuristic_update_sigma`: classic Boyd residual-balance multiplicative rule
   (σ *= τ when primal ≫ dual, σ /= τ when dual ≫ primal). Standard ADMM
   baseline for adaptive σ; predates OGD-style updates.
@@ -367,7 +375,14 @@ class LipschitzFloorOGD:
             mode = 'lipschitz'
         elif use_lipschitz_floor is False:
             mode = 'no_floor'
-        assert mode in ('lipschitz', 'no_floor', 'heuristic'), \
+        # Modes:
+        #   'lipschitz'           : OGD on (u-log(r/Δy))² + hard floor σ ≥ exp(L̂)
+        #   'no_floor'            : OGD on (u-log(r/Δy))², no floor (legacy convex_bal)
+        #   'heuristic'           : Boyd multiplicative on r vs σ·‖Δw_g‖
+        #   'true_bal'            : OGD on (u-log(r/s))² with s=σ·‖Δw_g‖, no floor
+        #   'true_bal_lipschitz'  : same OGD with the Lipschitz floor on top
+        assert mode in ('lipschitz', 'no_floor', 'heuristic',
+                        'true_bal', 'true_bal_lipschitz'), \
             f'unknown mode: {mode!r}'
 
         self.device = device
@@ -381,7 +396,8 @@ class LipschitzFloorOGD:
         self.lipschitz_floor_alpha = lipschitz_floor_alpha
         self.eps = eps
         self.mode = mode
-        self.use_lipschitz_floor = (mode == 'lipschitz')  # for back-compat reads
+        # for back-compat reads + grad-accumulation gate in callers
+        self.use_lipschitz_floor = mode in ('lipschitz', 'true_bal_lipschitz')
         self.heuristic_mu = heuristic_mu
         self.heuristic_tau = heuristic_tau
 
@@ -391,7 +407,7 @@ class LipschitzFloorOGD:
         self.sigma = float(sigma_init)
         self.update_step = 0
 
-        if mode == 'lipschitz':
+        if mode in ('lipschitz', 'true_bal_lipschitz'):
             self.estimator = BBLipschitzEstimator(
                 device=device,
                 estimator=estimator,
@@ -410,9 +426,11 @@ class LipschitzFloorOGD:
         """Run one σ-update event.
 
         Required inputs depend on `self.mode`:
-          - 'lipschitz': z_curr, grad_curr, primal_res, delta_y
-          - 'no_floor':                     primal_res, delta_y
-          - 'heuristic':                    primal_res,            dual_res
+          - 'lipschitz':           z_curr, grad_curr, primal_res, delta_y
+          - 'no_floor':                                primal_res, delta_y
+          - 'heuristic':                               primal_res,            dual_res
+          - 'true_bal':                                primal_res,            dual_res
+          - 'true_bal_lipschitz':  z_curr, grad_curr, primal_res,            dual_res
 
         Returns (sigma_float, metrics_dict).
         """
@@ -449,22 +467,34 @@ class LipschitzFloorOGD:
             }
             return self.sigma, metrics
 
-        # OGD-based modes: lipschitz / no_floor
-        if not torch.is_tensor(delta_y):
-            delta_y = torch.tensor(float(delta_y), device=self.device)
+        # OGD-based modes: lipschitz / no_floor / true_bal / true_bal_lipschitz
+        # Pick the "dual proxy" for the residual-balance target:
+        #   convex_bal flavors (lipschitz, no_floor): use Δy = ‖w_i^{k+1}-w_i^k‖
+        #   true_bal   flavors (true_bal*):           use s  = σ·‖w_g^{k+1}-w_g^k‖
+        if self.mode in ('true_bal', 'true_bal_lipschitz'):
+            if dual_res is None:
+                raise ValueError(f"mode {self.mode!r} requires `dual_res`")
+            dual_proxy = dual_res
+        else:
+            if delta_y is None:
+                raise ValueError(f"mode {self.mode!r} requires `delta_y`")
+            dual_proxy = delta_y
+        if not torch.is_tensor(dual_proxy):
+            dual_proxy = torch.tensor(float(dual_proxy), device=self.device)
+
         eta_u_eff = compute_eta_u_eff(
             self.eta_u, self.update_step, self.eta_u_decay
         )
 
         u = self.u_sigma.detach()
 
-        if self.mode == 'lipschitz':
+        if self.mode in ('lipschitz', 'true_bal_lipschitz'):
             L_hat_tensor = self.estimator.update(z_curr, grad_curr)
             (u_new, res_loss, target, log_L,
              floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
                 u=u,
                 primal_res=primal_res,
-                delta_y=delta_y,
+                delta_y=dual_proxy,
                 L_hat=L_hat_tensor,
                 eta_u=eta_u_eff,
                 G_clip=self.G_clip,
@@ -473,11 +503,11 @@ class LipschitzFloorOGD:
                 eps=self.eps,
                 lipschitz_floor_alpha=self.lipschitz_floor_alpha,
             )
-        else:  # no_floor
+        else:  # no_floor or true_bal
             (u_new, res_loss, target, grad_u) = online_convex_bal_update_u(
                 u=u,
                 primal_res=primal_res,
-                delta_y=delta_y,
+                delta_y=dual_proxy,
                 eta_u=eta_u_eff,
                 G_clip=self.G_clip,
                 u_min=self.u_min,
@@ -500,8 +530,11 @@ class LipschitzFloorOGD:
             'sigma/eta_u_eff': float(eta_u_eff),
             'sigma/update_step': self.update_step,
             'primal_res': float(primal_res.item()),
-            'delta_y': float(delta_y.item()),
         }
+        if self.mode in ('true_bal', 'true_bal_lipschitz'):
+            metrics['dual_res'] = float(dual_proxy.item())
+        else:
+            metrics['delta_y'] = float(dual_proxy.item())
 
         if self.mode == 'lipschitz':
             metrics['sigma/log_L_hat'] = float(log_L.item())
