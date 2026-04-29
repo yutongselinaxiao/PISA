@@ -19,20 +19,27 @@ with the σ-OGD + Lipschitz floor machinery wired in. Fixed-mode runs in this
 sweep should reproduce the paper's VGG-11 setup; the OGD-mode rows replace
 only the σ schedule.
 
-Five methods per cell (convex_bal_no_floor commented out as it failed
-catastrophically on VGG — see notes), all writing to
+Six methods per cell (convex_bal_no_floor commented out as it failed
+catastrophically on VGG), all writing to
 `paper-lipschitz-vision-cifar10-vgg`:
   - Original PISA fixed-σ schedule         (--sigma_mode fixed)
   - Boyd residual-balance heuristic         (--sigma_mode heuristic)
   - OGD with Lipschitz floor (legacy Δy)    (--sigma_mode online_convex_bal_lipschitz)
-  - OGD with canonical s=σ·‖Δw_g‖, no floor (--sigma_mode online_true_bal)
+  - OGD with canonical s, textbook_sc       (--sigma_mode online_true_bal, η_decay=textbook_sc)
   - OGD with canonical s + Lipschitz floor  (--sigma_mode online_true_bal_lipschitz)
+  - OGD with canonical s, conservative step (--sigma_mode online_true_bal,
+                                             η_decay=none, η_u=0.05, G_clip=1.0)
 
-σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 5 methods = 60 runs.
+σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 6 methods = 72 runs.
 
-The two `online_true_bal*` rows are the headline test of whether the
-σ-coupled dual residual fixes the OGD failure that the Δy proxy showed
-on VGG. See benchmark_ogd.tex §"VGG: σ-rule failure modes".
+Diagnostic finding from earlier VGG runs: textbook_sc decay gives
+η_eff(k=1)=0.5, so the first OGD step has |Δu| ≤ 0.5·G_clip = 2.5 in
+log-space → σ jumps by factor exp(2.5)≈12 in one step, lands exactly on a
+noisy first-round target value, σ collapses, dual π explodes, NaN. The
+heuristic doesn't have this problem because its discrete 2× step + dead-band
+never overshoots. The `true_bal_conservative` row tests whether OGD with
+constant η_u=0.05 and G_clip=1 can match the heuristic's stability while
+being continuous — closing the loop on the OGD-vs-heuristic comparison.
 
 Lipschitz config (changed from the earlier ema-estimator runs that all
 collapsed):
@@ -144,6 +151,18 @@ TRUE_BAL_LIPSCHITZ_EXTRA_ARGS = {
     "eta_u_decay": ETA_U_DECAY,
 }
 
+# Conservative OGD-true-bal: constant eta_u + smaller G_clip caps the
+# first-step jump in log(σ). textbook_sc with G_clip=5 produced |Δu|≤2.5
+# per step (12x in σ), causing σ to overshoot to ~0.5 from σ_0=4.5 in one
+# epoch on VGG. Constant 0.05 + G_clip=1 caps |Δu| ≤ 0.05 per step
+# (~5% σ change), comparable to heuristic's discrete 2x but continuous.
+TRUE_BAL_CONSERVATIVE_EXTRA_ARGS = {
+    "sigma_mode": "online_true_bal",
+    "eta_u": "0.05",
+    "eta_u_decay": "none",
+    "G_clip": "1.0",
+}
+
 HEURISTIC_EXTRA_ARGS = {
     "sigma_mode": "heuristic",
     "heuristic_mu": "10.0",
@@ -169,6 +188,11 @@ JOB_SPECS = [
         "spec_id": "true_bal_lipschitz",
         "extra_args": TRUE_BAL_LIPSCHITZ_EXTRA_ARGS,
         "tag": lambda sigma_lr: f"true_bal_lipschitz_decay{ETA_U_DECAY}_sig{sigma_lr}",
+    },
+    {
+        "spec_id": "true_bal_conservative",
+        "extra_args": TRUE_BAL_CONSERVATIVE_EXTRA_ARGS,
+        "tag": lambda sigma_lr: f"true_bal_constant_etau0p05_Gclip1_sig{sigma_lr}",
     },
     # {
     #     "spec_id": "convex_bal_no_floor",
