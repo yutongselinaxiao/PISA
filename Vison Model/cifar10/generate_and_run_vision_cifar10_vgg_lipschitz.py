@@ -1,27 +1,33 @@
-"""Vision-model CIFAR-10 + ResNet-34 sweep for the Lipschitz-floored online σ
+"""Vision-model CIFAR-10 + VGG-11 sweep for the Lipschitz-floored online σ
 adaptation method.
 
-Mirrors the centralized-vision regime from the SISA paper's Table 3 (the cell
-that produced the 95.04% ResNet-34 number) and adds our adaptive σ as an
-alternative to the original lr-coupled σ schedule.
+Sister generator to generate_and_run_vision_cifar10_lipschitz.py (which targets
+ResNet-34). Hyperparameters mirror the VGG entry in
+PISA/Vison Model/cifar10/readme.md (the paper's recommended VGG-11 command for
+Table 3, which produced the 91.25% headline number):
 
-Four methods per cell, all writing to `paper-lipschitz-vision-cifar10`:
+    python l2_lower_loss_mPiAM_varying_rho_sigma.py --model vgg --optim radam \
+        --eps 1e-8 --sigma_lr 4.5 --rho_lr 3e4 --beta1 0.9 --beta2 0.999 \
+        --momentum 0.9 --batchsize 128 --total_epoch 205 --decay_epoch 10 \
+        --lr-gamma 0.9 --baseline_acc 0.9103 --beta_rmsprop 0.995 \
+        --weight_decay 2.5e-4 --l2_lambda 4e-4
+
+Uses `l2_lower_loss_mPiAM_varying_rho_sigma_lipschitz.py` as the entry --
+the paper-faithful VGG-style training procedure (explicit --l2_lambda L2 on
+global w + per-sub-batch gradient-norm normalization in the local solver),
+with the σ-OGD + Lipschitz floor machinery wired in. Fixed-mode runs in this
+sweep should reproduce the paper's VGG-11 setup; the OGD-mode rows replace
+only the σ schedule.
+
+Four methods per cell, all writing to `paper-lipschitz-vision-cifar10-vgg`:
   - Original PISA fixed-σ schedule         (--sigma_mode fixed)
-  - Boyd residual-balance heuristic         (--sigma_mode heuristic, classic
-                                             ADMM σ-adaptation baseline)
-  - OGD on σ, no Lipschitz floor           (--sigma_mode online_convex_bal,
-                                             bounded only by [sigma_min, sigma_max])
+  - Boyd residual-balance heuristic         (--sigma_mode heuristic)
+  - OGD on σ, no Lipschitz floor           (--sigma_mode online_convex_bal)
   - OGD on σ + BB Lipschitz floor          (--sigma_mode online_convex_bal_lipschitz)
 
-σ-robustness sweep: σ_0 ∈ {0.1, 1e2, 1e3, 1e4} × 3 seeds × 4 methods = 48 runs.
-
-Hyperparameters mirror PISA/Vison Model/cifar10/readme.md (the paper's
-recommended ResNet-34 command). Differences from FL Data-Heterogenerity sweeps:
-  - Centralized split (--num_gpu sub-batches per mini-batch, no client partition)
-  - Total 205 epochs (paper) instead of comm_round=500
-  - bs=128 (paper) instead of 64
-  - σ-update fires once per epoch (sigma_update_freq = 50000/128 = 391)
-    matching the FL convention of one σ-OGD step per round.
+σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 4 methods = 48 runs.
+σ_0 = 4.5 is paper's VGG-tuned anchor (sanity check); 1e2-1e4 probe how each
+method degrades when σ_0 is far from the tuned value.
 """
 
 import stat
@@ -30,50 +36,47 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-OUTPUT_DIR = Path("generated_vision_cifar10_lipschitz")
+OUTPUT_DIR = Path("generated_vision_cifar10_vgg_lipschitz")
 LOG_DIR = OUTPUT_DIR / "logs"
 
-# ResNet-34 + bs=128 is heavy; 1 run/GPU is the safe default. Bump on bigger GPUs.
+# VGG-11 + bs=128 is much lighter than ResNet-34. Bump if you have headroom.
 CUDA_DEVICES = ["0", "1", "2", "3", "4", "5", "6", "7"]
-MAX_PARALLEL_PER_GPU = 1
+MAX_PARALLEL_PER_GPU = 2
 
 SEEDS = [0, 1, 2]
-# 0.1 is the paper's tuned value (sanity-check anchor); 1e2/1e3/1e4 probe σ₀-robustness.
-SIGMA_LR_VALUES = ["0.1", "1e2", "1e3", "1e4"]
+# 4.5 is paper's VGG-tuned anchor; 1e2/1e3/1e4 probe σ₀-robustness.
+SIGMA_LR_VALUES = ["4.5", "1e2", "1e3", "1e4"]
 
 ESTIMATOR = "ema"
 LIPSCHITZ_WINDOW_SIZE = "20"
 ETA_U_DECAY = "textbook_sc"
 
-# CIFAR-10 trainset size / batchsize = 50000 / 128 = ~391 batches per epoch.
-# Fire one σ-OGD step per epoch to match the FL convention (~205 updates over
-# the full run, comparable budget to comm_round=500 in the FL sweeps).
+# CIFAR-10 trainset / batchsize = 50000 / 128 = ~391 batches per epoch.
+# Fire one σ-OGD step per epoch.
 SIGMA_UPDATE_FREQ = "391"
 
-ENTRY = "lower_loss_mPiAM_training_procedure_lipschitz.py"
+ENTRY = "l2_lower_loss_mPiAM_varying_rho_sigma_lipschitz.py"
 
-# Single cell: ResNet-34 on cifar10 (matches paper's Table 3 headline).
-# Add VGG-11 / DenseNet-121 cells later if needed -- their hyperparameters
-# in readme.md differ enough that they warrant separate generators.
 CASES = [
-    {"case_name": "cifar10_resnet34", "model": "resnet"},
+    {"case_name": "cifar10_vgg11", "model": "vgg"},
 ]
 
-# Mirror PISA/Vison Model/cifar10/readme.md ResNet command.
+# Mirror the VGG command in readme.md (minus --l2_lambda; see header caveat).
 COMMON_ARGS = {
-    "optim": "adamw",
+    "optim": "radam",
     "eps": "1e-8",
-    "rho_lr": "5e3",
+    "rho_lr": "3e4",
     "beta1": "0.9",
     "beta2": "0.999",
     "momentum": "0.9",
     "batchsize": "128",
     "total_epoch": "205",
-    "decay_epoch": "3",
-    "lr-gamma": "0.85",
-    "weight_decay": "5e-5",
-    "baseline_acc": "95.00",
-    "beta_rmsprop": "0.999",
+    "decay_epoch": "10",
+    "lr-gamma": "0.9",
+    "weight_decay": "2.5e-4",
+    "baseline_acc": "91.03",
+    "beta_rmsprop": "0.995",
+    "l2_lambda": "4e-4",
     # ours -- fixed across the sweep
     "sigma_min": "1e-6",
     "sigma_max": "1e8",
@@ -90,7 +93,7 @@ COMMON_ARGS = {
     "sigma_lr": "${sigma_lr}",
     "seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "paper-lipschitz-vision-cifar10",
+    "wandb_project": "paper-lipschitz-vision-cifar10-vgg",
 }
 
 LIPSCHITZ_EXTRA_ARGS = {

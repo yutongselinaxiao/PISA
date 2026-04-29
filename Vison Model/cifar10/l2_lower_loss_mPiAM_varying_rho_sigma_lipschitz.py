@@ -1,20 +1,25 @@
-"""Train CIFAR10 with online adaptive σ + Lipschitz floor (centralized vision regime).
+"""Train CIFAR10 with online adaptive σ + Lipschitz floor — l2_lower_loss variant
+(matches the paper's Table 3 VGG-11 entry, which uses explicit L2 on the global
+w plus per-sub-batch gradient-norm normalization on top of the lower-loss procedure).
 
-Modified from lower_loss_mPiAM_training_procedure.py. Replaces the hardcoded
+Modified from l2_lower_loss_mPiAM_varying_rho_sigma.py. Replaces the hardcoded
 σ schedule
-    sigma_lr_current = ((1/(sigma+rho))/lr_curr) * sigma
-with an OGD update on u=log(σ) projected onto σ ≥ α·exp(L̂), where L̂ is the
-Barzilai-Borwein Lipschitz estimate from the BB ratio
-    L̂_k = ||g_k - g_{k-1}|| / ||z_k - z_{k-1}||
-on the global iterate z_k = W_global. Reuses the standalone module at
-../../Data Heterogenerity/lipschitz_ogd.py so the proof setup stays single-source.
+    sigma_lr_current = ((1/(σ+ρ))/lr_curr) * σ
+with an OGD update on u=log(σ) projected onto σ ≥ α·exp(L̂), reusing the
+standalone module at ../../Data Heterogenerity/lipschitz_ogd.py.
+
+Preserves all VGG-specific paper details intact:
+  - --l2_lambda flag (explicit L2 on global w via P_n_avg/(tau_lr + l2_lambda))
+  - normalized_factor[sb] per-sub-batch rescaling in the local solver
+  - generate_W_global_normalized aggregation
 
 Switch with --sigma_mode:
-  fixed                          (default): original lr-coupled schedule
-  online_convex_bal_lipschitz    : OGD-on-u with BB Lipschitz floor
+  fixed                          (default): original lr-coupled σ schedule
+  online_convex_bal              : OGD on u=log(σ), bounded only by [σ_min, σ_max]
+  online_convex_bal_lipschitz    : OGD plus σ ≥ α·exp(L̂) hard floor
 
-σ-update cadence is per mini-batch when --sigma_update_freq=1 (default), or
-once every K mini-batches if larger.
+σ-update cadence: per mini-batch when --sigma_update_freq=1 (default), or once
+every K mini-batches if larger.
 
 Adds wandb logging gated by --use_wandb.
 """
@@ -56,14 +61,6 @@ except ImportError:
     _WANDB_AVAILABLE = False
 
 
-def _seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -75,7 +72,7 @@ def str2bool(v):
 
 
 def get_parser():
-    parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training (lipschitz floor)')
+    parser = argparse.ArgumentParser(description='PyTorch CIFAR10 Training (l2 lipschitz)')
     parser.add_argument('--total_epoch', default=200, type=int)
     parser.add_argument('--decay_epoch', default=150, type=int)
     parser.add_argument('--model', default='resnet', type=str,
@@ -90,42 +87,35 @@ def get_parser():
     parser.add_argument('--gamma', default=1e-3, type=float)
     parser.add_argument('--eps', default=1e-8, type=float)
     parser.add_argument('--momentum', default=0.9, type=float)
-    parser.add_argument('--num_gpu', default=4, type=int,
-                        help='number of simulated parallel sub-batches per mini-batch')
-    parser.add_argument('--sigma_lr', default=0.08, type=float,
-                        help='initial σ (also the fixed-mode σ multiplier)')
-    parser.add_argument('--rho_lr', default=10000, type=float,
-                        help='ρ in the Adam-style preconditioner denominator')
+    parser.add_argument('--num_gpu', default=4, type=int)
+    parser.add_argument('--sigma_lr', default=0.08, type=float)
+    parser.add_argument('--rho_lr', default=10000, type=float)
     parser.add_argument('--beta_rmsprop', default=0.9, type=float)
     parser.add_argument('--beta1', default=0.9, type=float)
     parser.add_argument('--beta2', default=0.999, type=float)
     parser.add_argument('--baseline_acc', default=0.9, type=float)
     parser.add_argument('--resume', '-r', action='store_true')
     parser.add_argument('--batchsize', type=int, default=128)
+    parser.add_argument('--l2_lambda', default=0.0, type=float,
+                        help='explicit L2 on global w at aggregation: '
+                             'W_n_avg + P_n_avg / (tau_lr + l2_lambda)')
+    parser.add_argument('--seed', default=0, type=int)
     parser.add_argument('--weight_decay', default=5e-4, type=float)
     parser.add_argument('--reset', action='store_true')
     parser.add_argument('--device', default='cuda:0', type=str)
     parser.add_argument('--datadir', default='./data', type=str,
-                        help='root for torchvision CIFAR10 (matches FL entry convention)')
-    parser.add_argument('--seed', default=42, type=int,
-                        help='global RNG seed (random/numpy/torch)')
+                        help='CIFAR-10 root directory')
 
     # Adaptive σ (Lipschitz-floored OGD)
     parser.add_argument('--sigma_mode', type=str, default='fixed',
                         choices=['fixed', 'heuristic', 'online_convex_bal',
                                  'online_convex_bal_lipschitz'],
                         help='fixed = original lr-coupled schedule; '
-                             'heuristic = Boyd residual-balance multiplicative rule '
-                             '(σ *= τ when primal_res > μ·dual_res, σ /= τ when '
-                             'dual_res > μ·primal_res); '
-                             'online_convex_bal = OGD on u=log(σ) bounded only '
-                             'by [sigma_min, sigma_max] (no Lipschitz floor); '
-                             'online_convex_bal_lipschitz = same OGD plus a hard '
-                             'σ ≥ α·exp(L̂) floor from the BB Lipschitz estimator')
-    parser.add_argument('--heuristic_mu', type=float, default=10.0,
-                        help='residual ratio threshold for heuristic mode')
-    parser.add_argument('--heuristic_tau', type=float, default=2.0,
-                        help='multiplicative factor for heuristic mode')
+                             'heuristic = Boyd residual-balance multiplicative rule; '
+                             'online_convex_bal = OGD on u=log(σ), no floor; '
+                             'online_convex_bal_lipschitz = OGD + BB Lipschitz floor')
+    parser.add_argument('--heuristic_mu', type=float, default=10.0)
+    parser.add_argument('--heuristic_tau', type=float, default=2.0)
     parser.add_argument('--sigma_min', type=float, default=1e-6)
     parser.add_argument('--sigma_max', type=float, default=1e6)
     parser.add_argument('--eta_u', type=float, default=0.05,
@@ -134,9 +124,7 @@ def get_parser():
                         choices=['none', 'inverse', 'inv_sqrt', 'textbook_sc'])
     parser.add_argument('--G_clip', type=float, default=10.0)
     parser.add_argument('--sigma_update_freq', type=int, default=1,
-                        help='fire one σ-OGD step every this many mini-batches '
-                             '(default 1 = every mini-batch). Use len(train_loader) '
-                             'to fire once per epoch.')
+                        help='fire one σ-OGD step every this many mini-batches')
 
     # BB Lipschitz estimator
     parser.add_argument('--lipschitz_estimator', type=str, default='ema',
@@ -150,15 +138,12 @@ def get_parser():
 
     # wandb
     parser.add_argument('--use_wandb', type=str2bool, default=False)
-    parser.add_argument('--wandb_project', type=str, default='paper-lipschitz-vision-cifar10')
+    parser.add_argument('--wandb_project', type=str, default='paper-lipschitz-vision-cifar10-vgg')
     parser.add_argument('--wandb_entity', type=str, default=None)
     parser.add_argument('--wandb_run_name', type=str, default=None)
     parser.add_argument('--wandb_group', type=str, default=None)
     parser.add_argument('--wandb_job_type', type=str, default='train')
-    parser.add_argument('--wandb_log_per_step', type=str2bool, default=False,
-                        help='if True, log σ/L̂/residuals at every σ-update event '
-                             '(noisy but fine-grained). If False, log only the most '
-                             'recent σ-event metrics once per epoch.')
+    parser.add_argument('--wandb_log_per_step', type=str2bool, default=False)
 
     return parser
 
@@ -178,7 +163,7 @@ def build_dataset(args):
     trainset = torchvision.datasets.CIFAR10(root=args.datadir, train=True, download=True,
                                             transform=transform_train)
     train_loader = torch.utils.data.DataLoader(trainset, batch_size=args.batchsize,
-                                               shuffle=True, num_workers=2)
+                                               shuffle=False, num_workers=2)
     testset = torchvision.datasets.CIFAR10(root=args.datadir, train=False, download=True,
                                            transform=transform_test)
     test_loader = torch.utils.data.DataLoader(testset, batch_size=args.batchsize,
@@ -193,21 +178,15 @@ def get_ckpt_name(model, optimizer, lr, momentum, beta1, beta2, eps, weight_deca
         str(reset), run, sigma_mode)
 
 
-def build_model(args, device):
-    print('==> Building model..')
-    net = {'resnet': ResNet34, 'densenet': DenseNet121, 'vgg': vgg11}[args.model]()
-    net = net.to(device)
-    if 'cuda' in str(device):
-        net = torch.nn.DataParallel(net)
-        cudnn.benchmark = True
-    return net
-
-
-def zero_grad(params):
-    for param in params:
-        if param.grad is not None:
-            param.grad.detach_()
-            param.grad.zero_()
+def average_parameters_with_normalized(num_train_env, list_vars, list_alpha, list_normalized):
+    sum_vars = [torch.zeros_like(var) for var in list_vars[0]]
+    for i in range(num_train_env):
+        W_n = list_vars[i]
+        alpha = list_alpha[i]
+        normalized_factor = list_normalized[i]
+        sum_vars = [sum_ + alpha * update / normalized_factor
+                    for sum_, update in zip(sum_vars, W_n)]
+    return sum_vars
 
 
 def average_parameters(num_train_env, list_vars, list_alpha):
@@ -219,13 +198,73 @@ def average_parameters(num_train_env, list_vars, list_alpha):
     return sum_vars
 
 
-def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha):
+def generate_W_global(num_batches, W_n_list, P_n_list, tau_lr, alpha, l2_lambda):
     W_n_avg = average_parameters(num_batches, W_n_list, alpha)
     P_n_avg = average_parameters(num_batches, P_n_list, alpha)
     for i in range(len(W_n_avg)):
-        W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / tau_lr
+        W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / (tau_lr + l2_lambda)
         W_n_avg[i].detach()
     return W_n_avg
+
+
+def generate_W_global_normalized(num_batches, W_n_list, P_n_list, tau_lr, alpha,
+                                  list_normalized, l2_lambda):
+    W_n_avg = average_parameters(num_batches, W_n_list, alpha)
+    P_n_avg = average_parameters_with_normalized(num_batches, P_n_list, alpha,
+                                                  list_normalized)
+    for i in range(len(W_n_avg)):
+        W_n_avg[i] = W_n_avg[i] + P_n_avg[i] / (tau_lr + l2_lambda)
+        W_n_avg[i].detach()
+    return W_n_avg
+
+
+def build_model(args, device):
+    print('==> Building model..')
+    net = {'resnet': ResNet34, 'densenet': DenseNet121, 'vgg': vgg11}[args.model]()
+    net = net.to(device)
+    if 'cuda' in str(device):
+        net = torch.nn.DataParallel(net)
+        cudnn.benchmark = True
+    return net
+
+
+def create_optimizer(args, model_params):
+    args.optim = args.optim.lower()
+    if args.optim == 'sgd':
+        return optim.SGD(model_params, args.lr, momentum=args.momentum,
+                         weight_decay=args.weight_decay)
+    if args.optim == 'adam':
+        return Adam(model_params, args.lr, betas=(args.beta1, args.beta2),
+                    weight_decay=args.weight_decay, eps=args.eps)
+    if args.optim == 'fromage':
+        return Fromage(model_params, args.lr)
+    if args.optim == 'radam':
+        return RAdam(model_params, args.lr, betas=(args.beta1, args.beta2),
+                     weight_decay=args.weight_decay, eps=args.eps)
+    if args.optim == 'adamw':
+        return AdamW(model_params, args.lr, betas=(args.beta1, args.beta2),
+                     weight_decay=args.weight_decay, eps=args.eps)
+    if args.optim == 'adabelief':
+        return AdaBelief(model_params, args.lr, betas=(args.beta1, args.beta2),
+                         weight_decay=args.weight_decay, eps=args.eps)
+    if args.optim == 'yogi':
+        return Yogi(model_params, args.lr, betas=(args.beta1, args.beta2),
+                    weight_decay=args.weight_decay)
+    if args.optim == 'msvag':
+        return MSVAG(model_params, args.lr, betas=(args.beta1, args.beta2),
+                     weight_decay=args.weight_decay)
+    if args.optim == 'adabound':
+        return AdaBound(model_params, args.lr, betas=(args.beta1, args.beta2),
+                        final_lr=args.final_lr, gamma=args.gamma,
+                        weight_decay=args.weight_decay)
+    print('Optimizer not found')
+
+
+def zero_grad(params):
+    for param in params:
+        if param.grad is not None:
+            param.grad.detach_()
+            param.grad.zero_()
 
 
 def test(net, device, data_loader, criterion):
@@ -247,15 +286,26 @@ def test(net, device, data_loader, criterion):
     return accuracy
 
 
-def adjust_learning_rate(learning_rate, epoch, step_size, gamma):
-    """Original schedule preserved verbatim — only used in fixed sigma_mode."""
-    if epoch % step_size == 0 and 4 < epoch < 61:
+def adjust_learning_rate(learning_rate, epoch, step_size=25, gamma=0.5):
+    """Original VGG schedule preserved verbatim — only used in fixed sigma_mode."""
+    if epoch % 5 == 0 and 21 < epoch < 61:
         learning_rate *= gamma
-    if epoch % 10 == 0 and 61 < epoch < 99:
+    if epoch % step_size == 0 and 0 < epoch < 21:
         learning_rate *= gamma
-    if epoch % 25 == 0 and epoch > 99:
-        learning_rate *= 0.5
+    if epoch % step_size == 0 and 61 < epoch < 150:
+        learning_rate *= gamma
+    if epoch % 25 == 0 and epoch > 100:
+        learning_rate *= 0.35
     return learning_rate
+
+
+def _seed_everything(seed):
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def main():
@@ -300,7 +350,8 @@ def main():
     sigma_lr = args.sigma_lr
     alpha_b = [1.0 / args.num_gpu for _ in range(args.num_gpu)]
     print('alpha_b is: ', alpha_b)
-    W_global = generate_W_global(args.num_gpu, W_b_initial, P_b_initial, sigma_lr, alpha_b)
+    W_global = generate_W_global(args.num_gpu, W_b_initial, P_b_initial,
+                                  sigma_lr, alpha_b, args.l2_lambda)
     zero_grad(model.parameters())
 
     learning_rate_current = 1.0 / (args.sigma_lr + args.rho_lr)
@@ -309,6 +360,7 @@ def main():
     updated_iteration = 1.0
     best_acc = args.baseline_acc
     train_accuracies, test_accuracies = [], []
+    normalized_factor = []  # populated at epoch=0, iter_idx=0; one entry per sub-batch
 
     # ---- Adaptive-σ state (consumed in any non-fixed mode) ----
     floor = None
@@ -371,12 +423,11 @@ def main():
             sub_batch_size = images.size(0) // args.num_gpu
             alpha_b = []
 
-            # Snapshot z^k = W_global before any modification this round.
-            # Used by the BB estimator and by dual_res = ||W_g - W_g_prev||.
+            # Snapshot z^k = W_global before any modification this round
+            # (used by BB estimator and dual residual).
             z_curr_bb = [w.clone().detach() for w in W_global]
 
-            # Snapshot W_n^k for delta_y = ||W_n^{k+1} - W_n^k|| (per sub-batch,
-            # then alpha-averaged at the end).
+            # Snapshot W_n^k for delta_y = ||W_n^{k+1} - W_n^k||.
             W_n_prev_list = [
                 [w.clone().detach() for w in W_b_initial[sb]]
                 for sb in range(args.num_gpu)
@@ -416,8 +467,15 @@ def main():
                     param.grad + args.weight_decay * param for param in model.parameters()
                 ]
 
-                # Accumulate alpha-weighted grad at z^k for the BB estimator
-                # (only needed when the Lipschitz floor is active).
+                # Compute per-sub-batch gradient-norm normalizer at first iter.
+                if epoch == 0 and iter_idx == 0:
+                    factor = torch.sqrt(
+                        sum(torch.sum(g ** 2) for g in gradients if g is not None)
+                    )
+                    print('the l2-norm of gradient is:', factor)
+                    normalized_factor.append(factor)
+
+                # Accumulate alpha-weighted grad at z^k for the BB estimator.
                 if floor is not None and floor.use_lipschitz_floor:
                     if grad_global_curr is None:
                         grad_global_curr = [
@@ -438,9 +496,12 @@ def main():
                         bias_correction2 = 1 - args.beta_rmsprop ** updated_iteration
                         corrected_accumulator = accumulator / bias_correction2
 
+                        # paper-faithful local solver: σ and ρ both rescaled by
+                        # per-sub-batch normalized_factor.
                         delta = param_wg - (gradient + param_pn) / (
-                            sigma_lr_current
-                            + rho_lr_current * (torch.sqrt(corrected_accumulator) + args.eps)
+                            sigma_lr_current * normalized_factor[sb]
+                            + rho_lr_current * normalized_factor[sb]
+                            * (torch.sqrt(corrected_accumulator) + args.eps)
                         )
                         param_wn.copy_(delta.detach())
                         param_pn.add_(sigma_lr_current * (param_wn - param_wg))
@@ -449,11 +510,12 @@ def main():
 
             updated_iteration += 1
 
-            # Save W_global^k before re-aggregation (for dual_res).
+            # Save W_global^k before re-aggregation (for residual computation).
             W_global_prev = [w.clone().detach() for w in W_global]
             with torch.no_grad():
-                W_global = generate_W_global(
-                    args.num_gpu, W_b_initial, P_b_initial, sigma_lr_current, alpha_b
+                W_global = generate_W_global_normalized(
+                    args.num_gpu, W_b_initial, P_b_initial,
+                    sigma_lr_current, alpha_b, normalized_factor, args.l2_lambda
                 )
                 for param, w in zip(model.parameters(), W_global):
                     param.copy_(w)
@@ -461,7 +523,6 @@ def main():
             # ---- σ update event ----
             if floor is not None and (iter_idx + 1) % args.sigma_update_freq == 0:
                 with torch.no_grad():
-                    # Alpha-weighted primal residual: sum_i α_i ||W_n_i - W_g||
                     primal_res_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], z_curr_bb)])
                         for sb in range(args.num_gpu)
@@ -469,7 +530,6 @@ def main():
                     primal_res = sum(
                         alpha_b[sb] * primal_res_per_sb[sb] for sb in range(args.num_gpu)
                     )
-                    # Per-client local change ||W_n^{k+1} - W_n^k||, alpha-averaged.
                     delta_y_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], W_n_prev_list[sb])])
                         for sb in range(args.num_gpu)
@@ -477,7 +537,6 @@ def main():
                     delta_y = sum(
                         alpha_b[sb] * delta_y_per_sb[sb] for sb in range(args.num_gpu)
                     )
-                    # Dual residual = σ · ||ΔW_global|| (Boyd convention).
                     dual_res = sigma_lr_current * global_norm(
                         [a - b for a, b in zip(W_global, W_global_prev)]
                     )

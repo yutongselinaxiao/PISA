@@ -16,6 +16,9 @@ What's exported:
   mode from the FL entry — the σ_min you pass acts as SISA's user-chosen lower
   bound (SISA itself has no explicit floor; its schedules just never decrease
   σ, so its effective lower bound is σ_0).
+- `heuristic_update_sigma`: classic Boyd residual-balance multiplicative rule
+  (σ *= τ when primal ≫ dual, σ /= τ when dual ≫ primal). Standard ADMM
+  baseline for adaptive σ; predates OGD-style updates.
 - `compute_eta_u_eff`: diminishing step-size schedule
   (none | inverse | inv_sqrt | textbook_sc).
 - `BBLipschitzEstimator`: Barzilai-Borwein L̂ with
@@ -139,6 +142,26 @@ def online_convex_bal_update_u(
         target.detach(),
         grad_u.detach(),
     )
+
+
+def heuristic_update_sigma(sigma_old, primal_res, dual_res, mu=10.0, tau=2.0):
+    """Boyd residual-balance heuristic for ADMM σ.
+
+        σ_new = τ · σ_old   if  primal_res > μ · dual_res
+        σ_new = σ_old / τ   if  dual_res   > μ · primal_res
+        σ_new = σ_old       otherwise
+
+    Mirrors heuristic_update_sigma at experiment_sisa_practise_online.py:62.
+    Caller is responsible for clamping to [σ_min, σ_max] after this returns.
+    """
+    sigma_new = sigma_old
+    p = float(primal_res)
+    d = float(dual_res)
+    if p > mu * d:
+        sigma_new = sigma_old * tau
+    elif d > mu * p:
+        sigma_new = sigma_old / tau
+    return sigma_new
 
 
 def compute_eta_u_eff(eta_u, k_sigma, eta_u_decay='none'):
@@ -334,8 +357,19 @@ class LipschitzFloorOGD:
         lipschitz_floor_alpha=1.0,
         param_names=None,
         eps=1e-8,
-        use_lipschitz_floor=True,
+        use_lipschitz_floor=None,
+        mode='lipschitz',
+        heuristic_mu=10.0,
+        heuristic_tau=2.0,
     ):
+        # Backward-compat: legacy `use_lipschitz_floor` boolean still works.
+        if use_lipschitz_floor is True:
+            mode = 'lipschitz'
+        elif use_lipschitz_floor is False:
+            mode = 'no_floor'
+        assert mode in ('lipschitz', 'no_floor', 'heuristic'), \
+            f'unknown mode: {mode!r}'
+
         self.device = device
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
@@ -346,7 +380,10 @@ class LipschitzFloorOGD:
         self.G_clip = G_clip
         self.lipschitz_floor_alpha = lipschitz_floor_alpha
         self.eps = eps
-        self.use_lipschitz_floor = use_lipschitz_floor
+        self.mode = mode
+        self.use_lipschitz_floor = (mode == 'lipschitz')  # for back-compat reads
+        self.heuristic_mu = heuristic_mu
+        self.heuristic_tau = heuristic_tau
 
         self.u_sigma = torch.tensor(
             math.log(max(sigma_init, 1e-12)), device=device
@@ -354,7 +391,7 @@ class LipschitzFloorOGD:
         self.sigma = float(sigma_init)
         self.update_step = 0
 
-        if use_lipschitz_floor:
+        if mode == 'lipschitz':
             self.estimator = BBLipschitzEstimator(
                 device=device,
                 estimator=estimator,
@@ -368,28 +405,60 @@ class LipschitzFloorOGD:
             self.estimator = None
         self.param_names = param_names
 
-    def step(self, z_curr, grad_curr, primal_res, delta_y):
+    def step(self, z_curr=None, grad_curr=None, primal_res=None,
+             delta_y=None, dual_res=None):
         """Run one σ-update event.
 
-        z_curr, grad_curr: list[Tensor] (alpha-weighted accumulated gradient).
-            IGNORED when use_lipschitz_floor=False — caller may pass None.
-        primal_res, delta_y: scalar tensors on `device`.
+        Required inputs depend on `self.mode`:
+          - 'lipschitz': z_curr, grad_curr, primal_res, delta_y
+          - 'no_floor':                     primal_res, delta_y
+          - 'heuristic':                    primal_res,            dual_res
 
         Returns (sigma_float, metrics_dict).
         """
         self.update_step += 1
+
+        if not torch.is_tensor(primal_res):
+            primal_res = torch.tensor(float(primal_res), device=self.device)
+
+        if self.mode == 'heuristic':
+            if dual_res is None:
+                raise ValueError("heuristic mode requires `dual_res`")
+            if not torch.is_tensor(dual_res):
+                dual_res = torch.tensor(float(dual_res), device=self.device)
+            sigma_new = heuristic_update_sigma(
+                self.sigma,
+                primal_res,
+                dual_res,
+                mu=self.heuristic_mu,
+                tau=self.heuristic_tau,
+            )
+            sigma_new = max(self.sigma_min, min(self.sigma_max, sigma_new))
+            self.sigma = float(sigma_new)
+            self.u_sigma = torch.tensor(
+                math.log(max(self.sigma, 1e-12)), device=self.device
+            )
+            metrics = {
+                'sigma': self.sigma,
+                'log_sigma': float(self.u_sigma.item()),
+                'sigma/update_step': self.update_step,
+                'sigma/heuristic_mu': self.heuristic_mu,
+                'sigma/heuristic_tau': self.heuristic_tau,
+                'primal_res': float(primal_res.item()),
+                'dual_res': float(dual_res.item()),
+            }
+            return self.sigma, metrics
+
+        # OGD-based modes: lipschitz / no_floor
+        if not torch.is_tensor(delta_y):
+            delta_y = torch.tensor(float(delta_y), device=self.device)
         eta_u_eff = compute_eta_u_eff(
             self.eta_u, self.update_step, self.eta_u_decay
         )
 
-        if not torch.is_tensor(primal_res):
-            primal_res = torch.tensor(float(primal_res), device=self.device)
-        if not torch.is_tensor(delta_y):
-            delta_y = torch.tensor(float(delta_y), device=self.device)
-
         u = self.u_sigma.detach()
 
-        if self.use_lipschitz_floor:
+        if self.mode == 'lipschitz':
             L_hat_tensor = self.estimator.update(z_curr, grad_curr)
             (u_new, res_loss, target, log_L,
              floor_active, grad_u) = online_convex_bal_lipschitz_update_u(
@@ -404,7 +473,7 @@ class LipschitzFloorOGD:
                 eps=self.eps,
                 lipschitz_floor_alpha=self.lipschitz_floor_alpha,
             )
-        else:
+        else:  # no_floor
             (u_new, res_loss, target, grad_u) = online_convex_bal_update_u(
                 u=u,
                 primal_res=primal_res,
@@ -434,7 +503,7 @@ class LipschitzFloorOGD:
             'delta_y': float(delta_y.item()),
         }
 
-        if self.use_lipschitz_floor:
+        if self.mode == 'lipschitz':
             metrics['sigma/log_L_hat'] = float(log_L.item())
             metrics['sigma/L_hat'] = float(torch.exp(log_L).item())
             metrics['sigma/floor_active'] = float(floor_active.item())
