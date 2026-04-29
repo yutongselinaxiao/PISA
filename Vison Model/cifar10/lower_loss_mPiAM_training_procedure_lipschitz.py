@@ -64,6 +64,48 @@ def _seed_everything(seed):
         torch.cuda.manual_seed_all(seed)
 
 
+def _compute_inner_solver_diagnostics(
+    P_b, accumulators, num_sb, beta_rmsprop, updated_iter, eps,
+    sigma_curr, rho_curr,
+):
+    """Diagnostics for inner-solver instability (VGG/ResNet):
+      - ||π||: dual-variable L2 norm per sub-batch (mean and max). π runaway
+        is one suspected failure mode (gradient swamped by accumulated dual).
+      - mean(ρ·√v): preconditioner term in the local solver denominator.
+      - σ / mean(ρ·√v): leverage ratio.
+        << 1: ρ-dominance — σ adjustments have no effect on the inner step.
+        ~1: balanced.
+        >> 1: σ-dominated.
+    """
+    with torch.no_grad():
+        pi_norms = []
+        for sb in range(num_sb):
+            sq_sum = sum(p.detach().pow(2).sum() for p in P_b[sb])
+            pi_norms.append(float(torch.sqrt(sq_sum + 1e-12).item()))
+        pi_norm_mean = sum(pi_norms) / len(pi_norms) if pi_norms else 0.0
+        pi_norm_max = max(pi_norms) if pi_norms else 0.0
+
+        bc2 = max(1 - beta_rmsprop ** updated_iter, 1e-12)
+        rho_sv_sum, n_terms = 0.0, 0
+        for sb in range(num_sb):
+            for acc in accumulators[sb]:
+                corrected = acc.detach() / bc2
+                term = float(
+                    (rho_curr * (torch.sqrt(corrected) + eps)).mean().item()
+                )
+                rho_sv_sum += term
+                n_terms += 1
+        rho_sv_mean = rho_sv_sum / max(n_terms, 1)
+        ratio = sigma_curr / max(rho_sv_mean, 1e-12)
+
+    return {
+        'diagnostic/pi_norm_mean': pi_norm_mean,
+        'diagnostic/pi_norm_max': pi_norm_max,
+        'diagnostic/rho_sqrt_v_mean': rho_sv_mean,
+        'diagnostic/sigma_over_rho_sqrt_v': ratio,
+    }
+
+
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -527,6 +569,11 @@ def main():
                 log_dict['lr_current'] = learning_rate_current
             if floor is not None:
                 log_dict.update(last_floor_metrics)
+            log_dict.update(_compute_inner_solver_diagnostics(
+                P_b_initial, accumulators_initial, args.num_gpu,
+                args.beta_rmsprop, updated_iteration, args.eps,
+                sigma_lr_current, rho_lr_current,
+            ))
             wandb.log(log_dict, step=epoch)
 
         if not os.path.isdir('curve_lower_loss'):

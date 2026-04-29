@@ -26,6 +26,15 @@ Four methods per cell, all writing to `paper-lipschitz-vision-cifar10-vgg`:
   - OGD on σ + BB Lipschitz floor          (--sigma_mode online_convex_bal_lipschitz)
 
 σ-robustness sweep: σ_0 ∈ {4.5, 1e2, 1e3, 1e4} × 3 seeds × 4 methods = 48 runs.
+
+Lipschitz config (changed from the earlier ema-estimator runs that all
+collapsed):
+  - lipschitz_estimator = ema_per_layer_median (was "ema")
+  - lipschitz_max       = 1e6 (was 1e10)
+The earlier global-norm EMA pushed σ to sigma_max=1e8 on every VGG cell;
+the median-over-per-layer L̂s should drop outlier layers from the floor
+calculation, and the lower max prevents any single noisy step from
+saturating the ceiling.
 σ_0 = 4.5 is paper's VGG-tuned anchor (sanity check); 1e2-1e4 probe how each
 method degrades when σ_0 is far from the tuned value.
 """
@@ -47,7 +56,10 @@ SEEDS = [0, 1, 2]
 # 4.5 is paper's VGG-tuned anchor; 1e2/1e3/1e4 probe σ₀-robustness.
 SIGMA_LR_VALUES = ["4.5", "1e2", "1e3", "1e4"]
 
-ESTIMATOR = "ema"
+ESTIMATOR = "ema_per_layer_median"  # was "ema"; the global-norm BB ratio
+# blew up on VGG-11 (BN-free, gradients unstable) and pushed σ to the cap.
+# Per-layer median takes the median of per-parameter-group L̂s as the
+# scalar floor, dropping outlier layers from contributing.
 LIPSCHITZ_WINDOW_SIZE = "20"
 ETA_U_DECAY = "textbook_sc"
 
@@ -86,7 +98,9 @@ COMMON_ARGS = {
     "lipschitz_window_size": LIPSCHITZ_WINDOW_SIZE,
     "lipschitz_ema_beta": "0.9",
     "lipschitz_min_dz": "1e-6",
-    "lipschitz_max": "1e10",
+    "lipschitz_max": "1e6",  # was 1e10; cap raw L̂ so a single noisy
+    # gradient-step doesn't push σ to the sigma_max=1e8 ceiling on VGG.
+    # 1e6 still leaves room for the per-layer median to find a useful floor.
     "device": "cuda:0",
     "datadir": "/dataMeR2/yutong/datasets",
     # plumbed via shell template substitution
@@ -124,11 +138,11 @@ JOB_SPECS = [
         "extra_args": LIPSCHITZ_EXTRA_ARGS,
         "tag": lambda sigma_lr: f"lipschitz_decay{ETA_U_DECAY}_sig{sigma_lr}",
     },
-    {
-        "spec_id": "convex_bal_no_floor",
-        "extra_args": CONVEX_BAL_NO_FLOOR_EXTRA_ARGS,
-        "tag": lambda sigma_lr: f"convex_bal_no_floor_decay{ETA_U_DECAY}_sig{sigma_lr}",
-    },
+    # {
+    #     "spec_id": "convex_bal_no_floor",
+    #     "extra_args": CONVEX_BAL_NO_FLOOR_EXTRA_ARGS,
+    #     "tag": lambda sigma_lr: f"convex_bal_no_floor_decay{ETA_U_DECAY}_sig{sigma_lr}",
+    # },
     {
         "spec_id": "heuristic",
         "extra_args": HEURISTIC_EXTRA_ARGS,
