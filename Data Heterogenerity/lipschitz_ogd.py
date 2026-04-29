@@ -369,7 +369,15 @@ class LipschitzFloorOGD:
         mode='lipschitz',
         heuristic_mu=10.0,
         heuristic_tau=2.0,
+        dead_band_mu=1.0,
     ):
+        # dead_band_mu: trust-region threshold on |target|. When
+        # |log(r/s)| < log(dead_band_mu), the OGD update is skipped
+        # ("residuals balanced enough to be in the noise floor"). Mirrors the
+        # heuristic's μ-threshold dead-band. dead_band_mu=1.0 disables the
+        # dead-band (always update). Suggested: 10.0 to match Boyd's heuristic.
+        # Only applied to OGD-based modes (lipschitz / no_floor / true_bal*),
+        # not to 'heuristic' (which has the dead-band built in).
         # Backward-compat: legacy `use_lipschitz_floor` boolean still works.
         if use_lipschitz_floor is True:
             mode = 'lipschitz'
@@ -400,6 +408,9 @@ class LipschitzFloorOGD:
         self.use_lipschitz_floor = mode in ('lipschitz', 'true_bal_lipschitz')
         self.heuristic_mu = heuristic_mu
         self.heuristic_tau = heuristic_tau
+        self.dead_band_mu = float(dead_band_mu)
+        self._dead_band_log = (math.log(self.dead_band_mu)
+                               if self.dead_band_mu > 1.0 else 0.0)
 
         self.u_sigma = torch.tensor(
             math.log(max(sigma_init, 1e-12)), device=device
@@ -486,6 +497,20 @@ class LipschitzFloorOGD:
             self.eta_u, self.update_step, self.eta_u_decay
         )
 
+        # Dead-band: if |log(r / dual_proxy)| < log(dead_band_mu), residuals
+        # are within the trust region and OGD doesn't update u. Floor (in
+        # lipschitz modes) still applies. Mirrors heuristic's μ-threshold.
+        in_dead_band = False
+        if self._dead_band_log > 0:
+            with torch.no_grad():
+                target_check = (
+                    torch.log(torch.clamp(primal_res, min=self.eps))
+                    - torch.log(torch.clamp(dual_proxy, min=self.eps))
+                )
+                if abs(float(target_check.item())) < self._dead_band_log:
+                    in_dead_band = True
+                    eta_u_eff = 0.0  # zero-step: u unchanged by OGD
+
         u = self.u_sigma.detach()
 
         if self.mode in ('lipschitz', 'true_bal_lipschitz'):
@@ -529,6 +554,7 @@ class LipschitzFloorOGD:
             'sigma/grad_u': float(grad_u.item()),
             'sigma/eta_u_eff': float(eta_u_eff),
             'sigma/update_step': self.update_step,
+            'sigma/in_dead_band': float(in_dead_band),
             'primal_res': float(primal_res.item()),
         }
         if self.mode in ('true_bal', 'true_bal_lipschitz'):
