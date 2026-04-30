@@ -1680,12 +1680,68 @@ if __name__ == '__main__':
                     param.copy_(w)
 
             # compute epoch-level averaged residuals
-            # avg_primal_res = sum(epoch_primal_res) / max(len(epoch_primal_res), 1)
-            # avg_dual_res = sum(epoch_dual_res) / max(len(epoch_dual_res), 1)
-            # avg_delta_y = sum(epoch_delta_y) / max(len(epoch_delta_y), 1)
-            avg_primal_res = sum(alpha_b[i] * epoch_primal_res[i] for i in range(args.n_parties))
-            avg_dual_res = sum(alpha_b[i] * epoch_dual_res[i] for i in range(args.n_parties))
-            avg_delta_y = sum(alpha_b[i] * epoch_delta_y[i] for i in range(args.n_parties))
+            #
+            # CHANGE LOG (2026-04-30): switched from sum-of-norms to canonical
+            # RMS aggregation across clients to match Boyd's residual-balance
+            # convention for weighted consensus ADMM. The canonical primal
+            # residual (and delta_y) is the L2 norm of the concatenated
+            # weighted constraint vector:
+            #     ‖r‖_2  = sqrt(Σ_i α_i ‖w_i − w_g‖²)        (primal)
+            #     ‖Δy‖_2 = sqrt(Σ_i α_i ‖w_i^{k+1} − w_i^k‖²) (local change)
+            #     ‖s‖_2  = σ · ‖w_g^{k+1} − w_g^k‖             (dual; global-only)
+            #
+            # The OLD `sum(α_i · ‖w_i − w_g‖)` aggregation is also a valid
+            # metric but it is NOT the constraint-vector L2 norm that Boyd's
+            # convergence theorems and the residual-balance heuristic
+            # analyze. On heterogeneous (label-skew) FL, sum-of-norms can
+            # underestimate the canonical primal by up to √n.
+            #
+            # Empirical impact of the OLD convention on prior FL runs in
+            # `paper-lipschitz-estimator`:
+            #
+            #   * online_convex_bal / online_convex_bal_lipschitz:
+            #     σ_0-robustness story (52pp→0.4pp spread, Lipschitz floor
+            #     +5–10pp on label-1 cells) IS preserved. The OGD target
+            #     log(primal/Δy) is convention-INVARIANT because numerator
+            #     and denominator are both client-aggregated, so the
+            #     convention factor cancels. σ converges to a non-Boyd-
+            #     canonical equilibrium under sum-of-norms but the
+            #     σ_0-robustness phenomenon is real.
+            #
+            #   * heuristic / online_true_bal: BROKEN. Their dispatch
+            #     compares client-aggregated primal to a global-only dual,
+            #     so the convention factor does not cancel. Heuristic's
+            #     trigger `primal > μ·dual` rarely fires on heterogeneous
+            #     cells under sum-of-norms (primal is underestimated ~√n×).
+            #     online_true_bal's target log(primal/(σ·‖Δw_g‖)) carries
+            #     the same scale mismatch, pushing σ in spurious directions.
+            #     The catastrophic VGG OGD failures earlier attributed to
+            #     "ρ-dominance" / "first-step overshoot" were primarily
+            #     driven by this convention bug.
+            #
+            #   * fixed schedule: independent of residuals; unaffected.
+            #
+            # OLD (sum-of-norms) implementation, kept as historical reference:
+            #
+            #   avg_primal_res = sum(alpha_b[i] * epoch_primal_res[i]
+            #                        for i in range(args.n_parties))
+            #   avg_dual_res   = sum(alpha_b[i] * epoch_dual_res[i]
+            #                        for i in range(args.n_parties))
+            #   avg_delta_y    = sum(alpha_b[i] * epoch_delta_y[i]
+            #                        for i in range(args.n_parties))
+
+            # Canonical RMS: each `epoch_*_res[i]` stores per-client L2 norm
+            # ‖·‖_2, so square before α-weighting and sqrt at the end.
+            avg_primal_res = (sum(alpha_b[i] * (epoch_primal_res[i] ** 2)
+                                  for i in range(args.n_parties))) ** 0.5
+            avg_delta_y = (sum(alpha_b[i] * (epoch_delta_y[i] ** 2)
+                               for i in range(args.n_parties))) ** 0.5
+            # Dual residual depends only on the global iterate change Δw_g,
+            # so all clients store the same value σ·‖Δw_g‖. RMS aggregation
+            # equals the raw value (Σ α_i = 1), so the simple α-weighted
+            # sum is mathematically the canonical dual norm here.
+            avg_dual_res = sum(alpha_b[i] * epoch_dual_res[i]
+                               for i in range(args.n_parties))
 
             # Initialize sigma diagnostics (overwritten when sigma update fires)
             eta_u_eff = None

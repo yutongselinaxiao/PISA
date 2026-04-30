@@ -512,23 +512,43 @@ def main():
             # ---- σ update event ----
             if floor is not None and (iter_idx + 1) % args.sigma_update_freq == 0:
                 with torch.no_grad():
-                    # Alpha-weighted primal residual: sum_i α_i ||W_n_i - W_g||
+                    # CHANGE LOG (2026-04-30): switched from sum-of-norms to
+                    # canonical RMS aggregation across sub-batches to match
+                    # Boyd's residual-balance convention. The OLD form
+                    # `sum(α_i · ‖·‖)` underestimates the canonical L2
+                    # constraint-vector norm by up to √n on heterogeneous
+                    # sub-batches and breaks heuristic / online_true_bal
+                    # comparisons. See experiment_sisa_practise_online.py
+                    # change-log near `avg_primal_res` for the full rationale.
+                    #
+                    # OLD (sum-of-norms), kept as historical reference:
+                    #   primal_res = sum(alpha_b[sb] * primal_res_per_sb[sb]
+                    #                    for sb in range(args.num_gpu))
+                    #   delta_y    = sum(alpha_b[sb] * delta_y_per_sb[sb]
+                    #                    for sb in range(args.num_gpu))
                     primal_res_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], z_curr_bb)])
                         for sb in range(args.num_gpu)
                     ]
-                    primal_res = sum(
-                        alpha_b[sb] * primal_res_per_sb[sb] for sb in range(args.num_gpu)
+                    primal_sq = sum(
+                        alpha_b[sb] * (primal_res_per_sb[sb] ** 2)
+                        for sb in range(args.num_gpu)
                     )
-                    # Per-client local change ||W_n^{k+1} - W_n^k||, alpha-averaged.
+                    primal_res = torch.sqrt(primal_sq + 1e-24)
+
                     delta_y_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], W_n_prev_list[sb])])
                         for sb in range(args.num_gpu)
                     ]
-                    delta_y = sum(
-                        alpha_b[sb] * delta_y_per_sb[sb] for sb in range(args.num_gpu)
+                    delta_y_sq = sum(
+                        alpha_b[sb] * (delta_y_per_sb[sb] ** 2)
+                        for sb in range(args.num_gpu)
                     )
-                    # Dual residual = σ · ||ΔW_global|| (Boyd convention).
+                    delta_y = torch.sqrt(delta_y_sq + 1e-24)
+
+                    # Dual residual depends only on global-iterate change,
+                    # not per-sub-batch state, so canonical aggregation
+                    # equals the raw σ · ‖ΔW_global‖.
                     dual_res = sigma_lr_current * global_norm(
                         [a - b for a, b in zip(W_global, W_global_prev)]
                     )

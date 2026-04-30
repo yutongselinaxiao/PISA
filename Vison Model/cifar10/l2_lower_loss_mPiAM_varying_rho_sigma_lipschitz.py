@@ -574,20 +574,34 @@ def main():
             # ---- σ update event ----
             if floor is not None and (iter_idx + 1) % args.sigma_update_freq == 0:
                 with torch.no_grad():
+                    # CHANGE LOG (2026-04-30): canonical RMS residual
+                    # aggregation. See experiment_sisa_practise_online.py near
+                    # `avg_primal_res` for full rationale. OLD sum-of-norms
+                    # commented out below.
+                    #   primal_res = sum(alpha_b[sb] * primal_res_per_sb[sb]
+                    #                    for sb in range(args.num_gpu))
+                    #   delta_y    = sum(alpha_b[sb] * delta_y_per_sb[sb]
+                    #                    for sb in range(args.num_gpu))
                     primal_res_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], z_curr_bb)])
                         for sb in range(args.num_gpu)
                     ]
-                    primal_res = sum(
-                        alpha_b[sb] * primal_res_per_sb[sb] for sb in range(args.num_gpu)
+                    primal_sq = sum(
+                        alpha_b[sb] * (primal_res_per_sb[sb] ** 2)
+                        for sb in range(args.num_gpu)
                     )
+                    primal_res = torch.sqrt(primal_sq + 1e-24)
+
                     delta_y_per_sb = [
                         global_norm([a - b for a, b in zip(W_b_initial[sb], W_n_prev_list[sb])])
                         for sb in range(args.num_gpu)
                     ]
-                    delta_y = sum(
-                        alpha_b[sb] * delta_y_per_sb[sb] for sb in range(args.num_gpu)
+                    delta_y_sq = sum(
+                        alpha_b[sb] * (delta_y_per_sb[sb] ** 2)
+                        for sb in range(args.num_gpu)
                     )
+                    delta_y = torch.sqrt(delta_y_sq + 1e-24)
+
                     dual_res = sigma_lr_current * global_norm(
                         [a - b for a, b in zip(W_global, W_global_prev)]
                     )
