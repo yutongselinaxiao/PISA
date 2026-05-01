@@ -154,11 +154,9 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
     parser.add_argument('--optimizer', type=str, default='sgd',
-                        help="the optimizer: 'sgd', 'adam', 'amsgrad', 'adam_warmstart', "
-                             "'adamw_admm_explicit', or 'adamw_admm_implicit'. The two "
-                             "adamw_admm_* variants decouple the ADMM regularizer "
-                             "alpha*(pi + sigma*(w-w_g)) from Adam's m, v -- see "
-                             "notes/adam_warmstart_pseudocode.tex Algorithms 3 and 4.")
+                        help="the optimizer: 'sgd', 'adam', 'amsgrad', or "
+                             "'adam_warmstart' (Adam with m, v, t persisted across "
+                             "ADMM rounds via per-client optimizer_states).")
     parser.add_argument('--local_init', type=str, default='reset',
                         choices=['reset', 'warm'],
                         help="How to initialize the local solve at each ADMM round: "
@@ -166,12 +164,9 @@ def get_args():
                              "matches classical ADMM x-subproblem); 'warm' warm-starts "
                              "from w_i^{k-1}. Empirically warm regressed 36/70 cells in "
                              "Apr 2026 -- kept as opt-in for future work.")
-    parser.add_argument('--admm_reg_lr', type=float, default=None,
-                        help='Stepsize for the decoupled ADMM regularizer in '
-                             'adamw_admm_explicit / adamw_admm_implicit. Defaults to '
-                             '--lr if unset. For adamw_admm_explicit, choose so that '
-                             'admm_reg_lr * sigma is O(1) for stability; '
-                             'adamw_admm_implicit is unconditionally stable.')
+    # NOTE (2026-04-27, REMOVED): --admm_reg_lr was used for the AdamW-style
+    # decoupled-regularizer optimizers (adamw_admm_explicit, adamw_admm_implicit).
+    # Both variants were reverted -- see local_admm_train docstring CHANGE LOG.
     parser.add_argument('--mu', type=float, default=0.001, help='the mu parameter for fedprox')
     parser.add_argument('--noise', type=float, default=0, help='how much noise we add to some party')
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
@@ -185,7 +180,8 @@ def get_args():
     parser.add_argument('--terminate_decay', type=float, default=50, help='hyperparameter stop sigma decay in sisa')
     
     parser.add_argument('--sigma_mode', type=str, default='fixed',
-                        help='fixed / online_convex_bal / heuristic / online_task_aware')
+                        help='fixed / online_convex_bal / online_convex_bal_lipschitz / '
+                             'heuristic / online_task_aware')
     parser.add_argument('--sigma_min', type=float, default=1e-6,
                         help='minimum sigma')
     parser.add_argument('--sigma_max', type=float, default=1e4,
@@ -208,6 +204,30 @@ def get_args():
                         help='numerical epsilon')
     parser.add_argument('--task_lambda', type=float, default=1.0,
                         help='weight of task-awareness term in online_task_aware sigma mode')
+
+    # ---- OGD step-size schedule (consumed by online_convex_bal_lipschitz) ----
+    parser.add_argument('--eta_u_decay', type=str, default='none',
+                        choices=['none', 'inverse', 'inv_sqrt', 'textbook_sc'],
+                        help='OGD step schedule on u=log(sigma). textbook_sc = '
+                             '1/(2*k) (parameter-free, ignores --eta_u). k counts '
+                             'sigma-update events, not rounds.')
+
+    # ---- BB Lipschitz floor (consumed by online_convex_bal_lipschitz) ----
+    parser.add_argument('--lipschitz_estimator', type=str, default='ema',
+                        choices=['ema', 'running_min', 'running_median'],
+                        help='smoothing rule for BB-type Lipschitz estimate.')
+    parser.add_argument('--lipschitz_window_size', type=int, default=20,
+                        help='ring buffer size for running_min / running_median')
+    parser.add_argument('--lipschitz_ema_beta', type=float, default=0.9,
+                        help='EMA beta for L_hat smoothing')
+    parser.add_argument('--lipschitz_min_dz', type=float, default=1e-6,
+                        help='minimum ||z^k - z^{k-1}|| for a usable BB sample')
+    parser.add_argument('--lipschitz_max', type=float, default=1e8,
+                        help='upper clip on raw BB L_hat per round')
+    parser.add_argument('--lipschitz_floor_alpha', type=float, default=1.0,
+                        help='hard projection floor: sigma >= alpha * L_hat. '
+                             'alpha=1 reproduces the canonical hard projection.')
+
     parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
     parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
@@ -975,6 +995,49 @@ def diff_global_norm(list_a, list_b):
     return torch.sqrt(total)
 
 
+def global_norm(tensors):
+    """L2 norm of the concatenated tensor list (skipping Nones)."""
+    total = None
+    for t in tensors:
+        if t is None:
+            continue
+        v = t.detach()
+        val = (v * v).sum()
+        total = val if total is None else total + val
+    if total is None:
+        return torch.tensor(0.0)
+    return torch.sqrt(total + 1e-12)
+
+
+def compute_task_grad_at_z(model, train_dl_local, w_global, criterion, device):
+    """Compute the raw task-gradient sum (no 1/n_batches scaling) at z^k = w_global.
+
+    Used by the BB Lipschitz floor in online_convex_bal_lipschitz mode.
+    Mirrors the implicit accumulation in _online.py line 1631-1633: the
+    BB ratio ||dg||/||dz|| is scale-invariant, and consistency across
+    rounds requires the same per-client dataloader pass each round.
+
+    Side effect: leaves model parameters set to w_global (the local
+    solver will reset again on entry, so this is safe). Caller is
+    responsible for switching the model back to train mode after the
+    Adam-based local solve.
+    """
+    with torch.no_grad():
+        for p, wg in zip(model.parameters(), w_global):
+            p.copy_(wg)
+    model.train()
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad.zero_()
+    for x, target in train_dl_local:
+        x, target = x.to(device), target.to(device).long()
+        out = model(x)
+        loss = criterion(out, target)
+        loss.backward()
+    return [p.grad.detach().clone() if p.grad is not None else None
+            for p in model.parameters()]
+
+
 def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, device="cpu", alpha_i=1.0,
                      optimizer_state=None):
     """
@@ -999,14 +1062,6 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         optimizer_state. Adam sees the FULL aug Lagrangian gradient (task +
         dual + quadratic), so sigma's contribution to v cancels sigma out of
         the effective step magnitude (see notes/adam_warmstart_pseudocode.tex).
-      - 'adamw_admm_explicit'  : NEW (2026-04-24, Algorithm 3 in
-        notes/adam_warmstart_pseudocode.tex). Adam updates m, v from the TASK
-        gradient ONLY; the ADMM regularizer alpha_i*(pi + sigma*(w - w_g)) is
-        applied as an explicit decoupled subtraction with stepsize
-        args.admm_reg_lr. Avoids sigma cancellation in v.
-      - 'adamw_admm_implicit'  : NEW (Algorithm 4). Same task-only Adam step
-        plus explicit dual subtraction plus implicit Tikhonov prox of the
-        quadratic (sigma/2)||w - w_g||^2. Unconditionally stable for any sigma.
 
     CHANGE LOG (2026-04-24, REVERTED same day): briefly used local_init='warm'
     as default, removing the inner reset-to-w_global. Empirical verdict from
@@ -1019,14 +1074,36 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     regime (long local epochs on milder heterogeneity) that we have not yet
     characterized.
 
-    AdamW-style decoupled-regularizer optimizers added 2026-04-24 to address
-    the sigma-cancellation pathology of 'adam_warmstart'. See pseudocode in
-    notes/adam_warmstart_pseudocode.tex.
+    CHANGE LOG (2026-04-27, REVERTED): added two AdamW-style decoupled
+    optimizer variants -- 'adamw_admm_explicit' and 'adamw_admm_implicit' --
+    intended to fix the sigma-cancellation pathology of 'adam_warmstart' by
+    splitting the augmented Lagrangian gradient: Adam sees only the task
+    gradient, while the ADMM regularizer alpha*(pi + sigma*(w-w_g)) is
+    applied as a decoupled per-batch update. Pseudocode lived in
+    notes/adam_warmstart_pseudocode.tex Algorithms 3 and 4.
+
+    Failure mode: applying the regularizer per batch with stepsize
+    admm_reg_lr=1e-3 led to a per-batch shrinkage factor toward w_g of
+    eta_r * alpha * sigma / (1 + eta_r * alpha * sigma). With alpha~0.1
+    and sigma=1e4, this is ~50% per batch, so over ~100 batches per round
+    w is yanked to w_g and Adam's task step accumulates nothing. The model
+    sat at random-guess accuracy on cifar10 across all sigma. Same issue at
+    sigma=1e3 over a longer horizon. The sigma-cancellation in coupled
+    Adam was actually PROTECTIVE -- it normalized the regularizer contribution
+    down to ~lr scale; decoupling exposed its full strength which is too
+    strong when applied at every batch. SISA's closed-form update avoids
+    this because it computes w from scratch as wg - (g+pi)/(sigma + ...),
+    so the step is bounded by 1/sigma rather than scaling linearly with
+    sigma. A correct generalization (SISA-with-Adam-preconditioner: w_new
+    = wg - (g + pi) / (sigma + rho*sqrt(v_hat) + eps)) was discussed but
+    not implemented because the sigma-robustness story is driven by the
+    Lipschitz floor + textbook_sc decay (online.py), not the local solver.
+    Reverted both adamw_admm_* variants. See pilot file
+    generate_and_run_sisa_jobs_adamw_pilot.py for the failed launch.
 
     Returns:
         (params, avg_loss) for sgd/adam/amsgrad
-        (params, avg_loss, optimizer_state_dict) for adam_warmstart and the
-            two adamw_admm variants (these all carry persistent Adam state).
+        (params, avg_loss, optimizer_state_dict) for adam_warmstart
     """
     # ----- Initialization: reset (default) or warm-start (opt-in) -----
     local_init = getattr(args, "local_init", "reset")
@@ -1052,13 +1129,6 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg, amsgrad=True)
     elif args.optimizer == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.rho, weight_decay=args.reg)
-    elif args.optimizer in ('adamw_admm_explicit', 'adamw_admm_implicit'):
-        # Adam with persistent state (m, v, t) across rounds, but updated from
-        # the TASK gradient only. The ADMM regularizer is applied outside the
-        # optimizer step in the inner loop below.
-        optimizer = optim.Adam(model.parameters(), lr=args.lr)
-        if optimizer_state is not None:
-            optimizer.load_state_dict(optimizer_state)
     else:
         raise ValueError(f"Unsupported optimizer: {args.optimizer}")
 
@@ -1067,11 +1137,6 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
 
     epoch_loss = 0.0
     n_batches = 0
-    # decoupled regularizer stepsize; default to args.lr if --admm_reg_lr unset.
-    eta_r = getattr(args, "admm_reg_lr", None)
-    if eta_r is None:
-        eta_r = args.lr
-    decoupled = args.optimizer in ('adamw_admm_explicit', 'adamw_admm_implicit')
 
     for _ in range(args.epochs):
         for x, target in train_dl_local:
@@ -1081,59 +1146,26 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
             out = model(x)
             task_loss = criterion(out, target)
 
-            if decoupled:
-                # ----- AdamW-style decoupled inner loop -----
-                # 1) Adam sees only the task gradient (alpha_i scales the loss
-                #    so the gradient = alpha_i * grad F_i).
-                (alpha_i * task_loss).backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()  # m, v updated from task grad; w receives Adam step
+            dual_term = 0.0
+            quad_term = 0.0
+            for p, wg, pi in zip(model.parameters(), w_global, pi_local):
+                diff = p - wg
+                dual_term = dual_term + torch.sum(pi * diff)
+                quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
 
-                # 2) Apply ADMM regularizer alpha_i*(pi + sigma*(w-w_g)) as a
-                #    decoupled, no-grad parameter update.
-                with torch.no_grad():
-                    if args.optimizer == 'adamw_admm_explicit':
-                        # Explicit: w <- w - eta_r * alpha_i * (pi + sigma*(w - w_g))
-                        for p, wg, pi in zip(model.parameters(), w_global, pi_local):
-                            p.add_(-eta_r * alpha_i * (pi + sigma_lr * (p - wg)))
-                    else:  # adamw_admm_implicit
-                        # Step on pi explicitly; quadratic via implicit Tikhonov prox:
-                        #   p_new = (p - eta_r*alpha*pi + eta_r*alpha*sigma*w_g) / (1 + eta_r*alpha*sigma)
-                        denom = 1.0 + eta_r * alpha_i * sigma_lr
-                        for p, wg, pi in zip(model.parameters(), w_global, pi_local):
-                            p.add_(-eta_r * alpha_i * pi)              # explicit dual
-                            p.add_(eta_r * alpha_i * sigma_lr * wg)    # numerator: + eta_r*alpha*sigma*w_g
-                            p.div_(denom)                              # implicit prox
+            # alpha_i scales the whole augmented Lagrangian.
+            loss = alpha_i * (task_loss + dual_term + quad_term)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
 
-                # Loss tracking (full augmented Lagrangian for logging, no grad).
-                with torch.no_grad():
-                    dual_t = sum(torch.sum(pi * (p - wg)) for p, wg, pi in zip(model.parameters(), w_global, pi_local))
-                    quad_t = sum(0.5 * sigma_lr * torch.sum((p - wg) ** 2) for p, wg in zip(model.parameters(), w_global))
-                    full_loss = alpha_i * (task_loss + dual_t + quad_t)
-                epoch_loss += float(full_loss.item())
-
-            else:
-                # ----- Original behavior: full augmented-Lagrangian gradient -----
-                dual_term = 0.0
-                quad_term = 0.0
-                for p, wg, pi in zip(model.parameters(), w_global, pi_local):
-                    diff = p - wg
-                    dual_term = dual_term + torch.sum(pi * diff)
-                    quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
-
-                # alpha_i scales the whole augmented Lagrangian.
-                loss = alpha_i * (task_loss + dual_term + quad_term)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                optimizer.step()
-                epoch_loss += loss.item()
-
+            epoch_loss += loss.item()
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
     params = [p.detach().clone() for p in model.parameters()]
 
-    if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit', 'adamw_admm_implicit'):
+    if args.optimizer == 'adam_warmstart':
         return params, avg_loss, optimizer.state_dict()
     return params, avg_loss
 
@@ -1202,6 +1234,49 @@ def online_convex_bal_update_u(
         loss_val = 0.5 * (u - target).pow(2)
 
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
+
+
+def online_convex_bal_lipschitz_update_u(
+    u,
+    primal_res,
+    dual_base,
+    L_hat,
+    eta_u=0.05,
+    G_clip=10.0,
+    u_min=math.log(1e-6),
+    u_max=math.log(1e4),
+    eps=1e-12,
+    lipschitz_floor_alpha=1.0,
+):
+    """OGD on u=log(sigma) with hard Lipschitz projection (port of the
+    canonical _online.py implementation). The projection enforces
+        sigma >= alpha * L_hat
+    by taking a max in log-space after the OGD step. alpha=1 reproduces
+    the original hard projection used in adaptive_sigma_lipschitz_proof.tex.
+
+    Returns: (u_new, residual_loss, target, log_L, floor_active, grad_u).
+    """
+    primal_clip = torch.clamp(primal_res.detach(), min=eps)
+    dual_clip = torch.clamp(dual_base.detach(), min=eps)
+    L_clip = torch.clamp(L_hat.detach(), min=eps)
+
+    target = torch.log(primal_clip) - torch.log(dual_clip)
+    log_L = torch.log(L_clip)
+    log_floor = log_L + math.log(max(lipschitz_floor_alpha, eps))
+
+    diff = u - target
+    res_loss = diff.pow(2)
+    grad_u = 2.0 * diff
+    grad_u = torch.clamp(grad_u, -G_clip, G_clip)
+
+    with torch.no_grad():
+        u_raw = u - eta_u * grad_u
+        floor_active = (u_raw < log_floor).to(log_floor.dtype)
+        u_new = torch.maximum(u_raw, log_floor)
+        u_new = torch.clamp(u_new, min=u_min, max=u_max)
+
+    return (u_new.detach(), res_loss.detach(), target.detach(),
+            log_L.detach(), floor_active.detach(), grad_u.detach())
 
 
 def online_task_aware_update_u(
@@ -1501,6 +1576,22 @@ if __name__ == '__main__':
         task_lambda = getattr(args, "task_lambda", 1.0)
         prev_train_loss = None
 
+        # ---- BB Lipschitz floor state (consumed by online_convex_bal_lipschitz) ----
+        eta_u_decay = getattr(args, "eta_u_decay", "none")
+        lipschitz_estimator = getattr(args, "lipschitz_estimator", "ema")
+        lipschitz_window_size = getattr(args, "lipschitz_window_size", 20)
+        lipschitz_ema_beta = getattr(args, "lipschitz_ema_beta", 0.9)
+        lipschitz_min_dz = getattr(args, "lipschitz_min_dz", 1e-6)
+        lipschitz_max = getattr(args, "lipschitz_max", 1e8)
+        lipschitz_floor_alpha = getattr(args, "lipschitz_floor_alpha", 1.0)
+        grad_global_prev = None
+        z_prev_bb = None
+        L_hat_ema = torch.tensor(0.0, device=device)
+        L_hat_buffer = []
+        # k counter for textbook_sc 1/(2k) — increments each sigma-update fire
+        # so the schedule is invariant to sigma_update_freq (matches _online.py).
+        sigma_update_step = 0
+
         # u = log sigma for online update
         u_sigma = torch.tensor(
             math.log(max(sigma_lr, eps_val)),
@@ -1551,9 +1642,17 @@ if __name__ == '__main__':
             with open(meta_path, "w") as _mf:
                 json.dump(vars(args), _mf, indent=2, default=str)
 
+        bb_criterion = nn.CrossEntropyLoss().to(device)
+
         for round_idx in range(args.comm_round):
             logger.info(f"ADMM round {round_idx}")
             W_global_prev = [w.detach().clone() for w in W_global]
+
+            # Snapshot z^k for BB Lipschitz estimate (only used by lipschitz mode)
+            z_curr_bb = None
+            grad_global_curr = None
+            if sigma_mode == "online_convex_bal_lipschitz":
+                z_curr_bb = [w.detach().clone() for w in W_global]
 
             # -----------------------------------------
             # 1) Local primal step: update each w_i^{k+1}
@@ -1586,6 +1685,25 @@ if __name__ == '__main__':
                         dataidxs, noise_level
                     )
 
+                # BB Lipschitz: per-client task-grad pass at z^k = W_global,
+                # accumulated alpha-weighted into grad_global_curr. Done BEFORE
+                # the local solve so model state at z^k is preserved for the
+                # gradient. local_admm_train's `reset` init will overwrite the
+                # model again, so this leaves no residue.
+                if sigma_mode == "online_convex_bal_lipschitz":
+                    grad_i = compute_task_grad_at_z(
+                        model, train_dl_local, W_global, bb_criterion, device,
+                    )
+                    if grad_global_curr is None:
+                        grad_global_curr = [
+                            torch.zeros_like(g) if g is not None else None
+                            for g in grad_i
+                        ]
+                    with torch.no_grad():
+                        for j, g in enumerate(grad_i):
+                            if g is not None and grad_global_curr[j] is not None:
+                                grad_global_curr[j].add_(alpha_b[sb] * g)
+
                 result = local_admm_train(
                     model=model,
                     train_dl_local=train_dl_local,
@@ -1598,7 +1716,7 @@ if __name__ == '__main__':
                     optimizer_state=optimizer_states[sb]
                 )
 
-                if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit', 'adamw_admm_implicit'):
+                if args.optimizer == 'adam_warmstart':
                     W_i_new, avg_local_loss, optimizer_states[sb] = result
                 else:
                     W_i_new, avg_local_loss = result
@@ -1670,6 +1788,51 @@ if __name__ == '__main__':
             sigma_res_loss = None
             sigma_task_loss = None
             ta_loss_increase = None
+            lf_log_L = None
+            lf_floor_active = None
+            L_hat_tensor = None
+            eta_u_eff = None
+
+            # BB Lipschitz update: needs previous round's grad and z, so the
+            # estimate first becomes available from round 1. Mirrors
+            # _online.py lines 1762-1851.
+            if (sigma_mode == "online_convex_bal_lipschitz"
+                    and grad_global_curr is not None):
+                with torch.no_grad():
+                    if grad_global_prev is not None and z_prev_bb is not None:
+                        dz_tensors = [a - b for a, b in zip(z_curr_bb, z_prev_bb)]
+                        dz_norm = global_norm(dz_tensors)
+                        if dz_norm.item() >= lipschitz_min_dz:
+                            dg_tensors = []
+                            for a, b in zip(grad_global_curr, grad_global_prev):
+                                if a is None and b is None:
+                                    continue
+                                if a is None:
+                                    dg_tensors.append(-b.detach())
+                                elif b is None:
+                                    dg_tensors.append(a.detach())
+                                else:
+                                    dg_tensors.append(a.detach() - b.detach())
+                            dg_norm = global_norm(dg_tensors)
+                            L_hat_raw = torch.clamp(dg_norm / dz_norm, max=lipschitz_max)
+                            L_hat_ema = (lipschitz_ema_beta * L_hat_ema
+                                         + (1.0 - lipschitz_ema_beta) * L_hat_raw)
+                            L_hat_buffer.append(float(L_hat_raw.item()))
+                            if len(L_hat_buffer) > lipschitz_window_size:
+                                L_hat_buffer.pop(0)
+
+                    if lipschitz_estimator == "ema":
+                        L_hat_tensor = L_hat_ema.clone()
+                    elif lipschitz_estimator == "running_min" and L_hat_buffer:
+                        L_hat_tensor = torch.tensor(min(L_hat_buffer), device=device)
+                    elif lipschitz_estimator == "running_median" and L_hat_buffer:
+                        sb_buf = sorted(L_hat_buffer)
+                        n_buf = len(sb_buf)
+                        med = (sb_buf[n_buf // 2] if n_buf % 2 == 1
+                               else 0.5 * (sb_buf[n_buf // 2 - 1] + sb_buf[n_buf // 2]))
+                        L_hat_tensor = torch.tensor(med, device=device)
+                    else:
+                        L_hat_tensor = torch.tensor(0.0, device=device)
 
             # -----------------------------------------
             # 5) Adaptive sigma update for NEXT round
@@ -1706,6 +1869,34 @@ if __name__ == '__main__':
                         u_max=math.log(sigma_max),
                         eps=eps_val,
                         G_clip=G_clip,
+                    )
+                    u_sigma = u_new
+                    sigma_lr = float(torch.exp(u_new).item())
+
+                elif sigma_mode == "online_convex_bal_lipschitz":
+                    sigma_update_step += 1
+                    L_hat_arg = (L_hat_tensor if L_hat_tensor is not None
+                                 else torch.tensor(0.0, device=device))
+                    if eta_u_decay == "inverse":
+                        eta_u_eff = eta_u / sigma_update_step
+                    elif eta_u_decay == "inv_sqrt":
+                        eta_u_eff = eta_u / math.sqrt(sigma_update_step)
+                    elif eta_u_decay == "textbook_sc":
+                        eta_u_eff = 1.0 / (2.0 * sigma_update_step)
+                    else:
+                        eta_u_eff = eta_u
+                    (u_new, sigma_loss, sigma_target, lf_log_L,
+                     lf_floor_active, sigma_grad) = online_convex_bal_lipschitz_update_u(
+                        u=u_sigma,
+                        primal_res=primal_smooth,
+                        dual_base=dual_smooth,
+                        L_hat=L_hat_arg,
+                        eta_u=eta_u_eff,
+                        G_clip=G_clip,
+                        u_min=math.log(sigma_min),
+                        u_max=math.log(sigma_max),
+                        eps=eps_val,
+                        lipschitz_floor_alpha=lipschitz_floor_alpha,
                     )
                     u_sigma = u_new
                     sigma_lr = float(torch.exp(u_new).item())
@@ -1781,6 +1972,19 @@ if __name__ == '__main__':
                     log_dict["sigma/task_loss"] = sigma_task_loss.item()
                     log_dict["sigma/loss_increase"] = ta_loss_increase
 
+                if sigma_mode == "online_convex_bal_lipschitz":
+                    if lf_log_L is not None:
+                        log_dict["sigma/log_L_hat"] = lf_log_L.item()
+                        log_dict["sigma/L_hat"] = float(torch.exp(lf_log_L).item())
+                    if lf_floor_active is not None:
+                        log_dict["sigma/floor_active"] = lf_floor_active.item()
+                    if L_hat_tensor is not None:
+                        log_dict["sigma/L_hat_ema"] = float(L_hat_tensor.item())
+                    log_dict["sigma/L_hat_buffer_size"] = len(L_hat_buffer)
+                    if eta_u_eff is not None:
+                        log_dict["sigma/eta_u_eff"] = float(eta_u_eff)
+                    log_dict["sigma/update_step"] = sigma_update_step
+
                 for sb in range(args.n_parties):
                     client_sq = None
                     for wi, wg in zip(W_b_initial[sb], W_global):
@@ -1814,6 +2018,11 @@ if __name__ == '__main__':
                 }
                 local_csv_writer.writerow(csv_row)
                 local_csv_file.flush()
+
+            # Rotate BB Lipschitz state for next round.
+            if sigma_mode == "online_convex_bal_lipschitz":
+                grad_global_prev = grad_global_curr
+                z_prev_bb = z_curr_bb
 
         if local_csv_file is not None:
             local_csv_file.close()
