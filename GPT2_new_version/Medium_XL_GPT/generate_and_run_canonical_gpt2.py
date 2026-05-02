@@ -79,13 +79,16 @@ def build_command(size: str, method: str, sigma_lr: str, seed: int, nproc: int,
 
     # NOTE: configurator.py expects --key=value (with -- prefix) for overrides;
     # bare names are interpreted as config-file paths. See configurator.py L20-23.
+    # configurator.py also enforces type(attempt) == type(globals()[key]) (L42),
+    # so we cannot override globals whose default is None (e.g. wandb_run_name)
+    # with a string -- skip that override and rely on the train script's
+    # fallback `name = wandb_run_name or comment` (line 1240).
     overrides = [
         f"--sigma_lr={sigma_lr}",
         f"--seed={seed}",
         f"--comment={tag}",
         f"--save_dir={save_root}/log_gpt2/{tag}",
         f"--out_dir={save_root}/out_gpt2/{tag}",
-        f"--wandb_run_name={tag}",
     ]
 
     prefix = f"CUDA_VISIBLE_DEVICES={gpus} " if gpus else ""
