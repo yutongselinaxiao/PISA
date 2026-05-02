@@ -102,8 +102,33 @@ algorithm = 'muon'
 admm_mode = 'linearized'  # 'linearized' (existing SISA) or 'exact' (exact ADMM inner loop)
 admm_inner_steps = 5  # number of inner gradient steps for exact ADMM mode
 admm_inner_lr = 1e-3  # learning rate for inner loop in exact ADMM mode
-sigma_adapt_mode = 'convex_bal'  # 'convex_bal' or 'task_aware'
-task_lambda = 1.0  # weight of task-awareness term (only used when sigma_adapt_mode='task_aware')
+sigma_adapt_mode = 'convex_bal'  # legacy: 'convex_bal' or 'task_aware' (kept for the legacy SigmaRhoScheduler path)
+task_lambda = 1.0  # weight of task-awareness term (only used when sigma_method='task_aware')
+
+# ---- Top-level sigma_0 / rho_0 (configurator-overridable) ----
+# Previously these only existed as Hyperparameters dataclass fields, which made
+# config files unable to sweep sigma_0. Now they are module globals so configs
+# can set `sigma_lr = 1e3` etc.
+sigma_lr = 8e1
+rho_lr = 1e2
+
+# ---- Canonical sigma rule dispatcher (matches _online.py semantics) ----
+# 'original'      : LR-coupled fixed schedule, no residual feedback.
+# 'ogd'           : canonical OGD on (u - target)^2 with target = log(primal/dual).
+# 'ogd_lipschitz' : canonical OGD + hard projection u >= log(alpha * L_hat).
+# 'task_aware'    : legacy task-aware variant (kept for backward compat).
+sigma_method = 'ogd'
+ogd_eta_u = 0.05
+ogd_eta_u_decay = 'textbook_sc'  # 'none' (constant ogd_eta_u) | 'textbook_sc' (= 1/(2*k))
+ogd_G_clip = 10.0
+sigma_min_canonical = 1e-3
+sigma_max_canonical = 1e6
+# BB Lipschitz floor (used only when sigma_method='ogd_lipschitz')
+lipschitz_ema_beta = 0.9
+lipschitz_window_size = 20
+lipschitz_min_dz = 1e-6
+lipschitz_max = 1e8
+lipschitz_floor_alpha = 1.0
 flash_attn = True
 # wandb
 use_wandb = True
@@ -438,15 +463,17 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
                 w = prev_W_global[i] - (current_grad + self.epsilon_vv**self._step * vv) / denom
                 pb.copy_((pb.add_(sigma_lr_i * (w - prev_W_global[i]))).mul_(alpha_b))
-                w *= alpha_b
 
-                wpi = sigma_lr*w + pb
+                # Store the UNSCALED w_i for the canonical primal-residual aggregation.
+                # The α_i scaling is applied only to the wpi sent over all-reduce.
                 local_w_list.append(w.detach().clone())
+                w *= alpha_b
+                wpi = sigma_lr*w + pb
                 updates_flat_w[curr_idx:curr_idx+p.numel()] = wpi.flatten()
                 curr_idx += p.numel()
 
         # 2. Global aggregation
-        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global)
+        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global, alpha_b)
 
     def _step_exact(self, closure=None):
         """
@@ -513,23 +540,38 @@ class DistributedOptimizer(torch.optim.Optimizer):
                 # Scale by alpha for consistency with the linearized version's convention
                 pb.copy_((pb + sigma_lr * (w_i - w_global)) * alpha_b)
 
+                # Store the UNSCALED w_i for the canonical primal-residual aggregation.
+                local_w_list.append(w_i.detach().clone())
                 w_scaled = w_i * alpha_b
                 wpi = sigma_lr * w_scaled + pb
-                local_w_list.append(w_scaled.detach().clone())
                 updates_flat_w[curr_idx:curr_idx+p.numel()] = wpi.flatten()
                 curr_idx += p.numel()
 
         # 2. Global aggregation (shared with linearized)
-        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global)
+        self._global_aggregate(updates_flat_w, local_w_list, prev_W_global, alpha_b)
 
-    def _global_aggregate(self, updates_flat_w, local_w_list, prev_W_global):
-        """Global aggregation step shared by both linearized and exact modes."""
+    def _global_aggregate(self, updates_flat_w, local_w_list, prev_W_global, alpha_b):
+        """Global aggregation + canonical RMS residual computation.
+
+        Primal residual (canonical, matching `_online.py` post-2026-04-30):
+            ‖r‖_2 = sqrt(Σ_i α_i ‖w_i − w_g^{k+1}‖²)
+        Dual residual:
+            ‖s‖_2 = σ · ‖w_g^{k+1} − w_g^k‖   (global-only; same on every rank)
+
+        Each rank contributes α_i · ‖w_i_local − new_W‖² (using the UNSCALED
+        local solution w_i stored in local_w_list); these contributions are
+        summed across ranks via all_reduce(SUM).
+        """
         sigma_lr = self.param_groups[0]['sigma_lr']
 
         dist.all_reduce(updates_flat_w, op=dist.ReduceOp.SUM)
 
         curr_idx = 0
-        primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        # Per-rank contribution to canonical primal_sq: Σ_layer ‖w_i − new_W‖²
+        # (will be α_i-weighted then SUM-reduced across ranks below).
+        local_primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        # dual_sq is global (depends on new_W and prev_W_global only) so all
+        # ranks compute the same value; no all-reduce needed.
         dual_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
 
         for i, para in enumerate(self.params):
@@ -537,22 +579,40 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
             sigma_lr_i = sigma_lr
             new_W = wpi / (sigma_lr_i+self.args.l2_lambda)
-            primal_sq += ((local_w_list[i].to(torch.float32) - new_W.to(torch.float32)) ** 2).sum()
+            local_primal_sq += ((local_w_list[i].to(torch.float32) - new_W.to(torch.float32)) ** 2).sum()
             dual_sq += ((new_W.to(torch.float32) - prev_W_global[i].to(torch.float32)) ** 2).sum()
 
             para.data.copy_(new_W)
 
             curr_idx += para.numel()
 
-        self.last_primal_res = torch.sqrt(primal_sq + 1e-16).item()
+        # Apply α_i-weighting to this rank's contribution, then SUM across ranks.
+        local_primal_sq = local_primal_sq * float(alpha_b)
+        dist.all_reduce(local_primal_sq, op=dist.ReduceOp.SUM)
+
+        self.last_primal_res = torch.sqrt(local_primal_sq + 1e-16).item()
         self.last_dual_res = (float(sigma_lr) * torch.sqrt(dual_sq + 1e-16)).item()
 
         self._step += 1
 
 class SigmaRhoScheduler:
     """
-    LR-coupled base schedule + convex-bal correction on log(sigma).
-    rho is kept proportional to sigma.
+    Sigma rule dispatcher with three canonical modes (matching `_online.py`):
+
+    - 'original'      : LR-coupled fixed schedule, no residual feedback.
+    - 'ogd'           : canonical OGD on (u - target)^2 with target=log(primal/dual).
+                        No EMA on residuals, no anchor, no trust region. Direct
+                        port of `online_convex_bal_update_u` from _online.py.
+    - 'ogd_lipschitz' : canonical OGD + hard projection u >= log(alpha * L_hat).
+                        BB Lipschitz estimate is updated externally via
+                        `update_lipschitz(grad_flat, z_flat)` from the train loop.
+                        Default eta schedule: textbook_sc = 1/(2*k_sigma).
+
+    rho is kept proportional to sigma in all OGD modes.
+
+    The legacy 'task_aware' mode is preserved for backward compatibility with
+    the existing config; it uses an EMA on residuals and an anchored target
+    (NOT canonical OGD).
     """
     def __init__(
         self,
@@ -560,6 +620,19 @@ class SigmaRhoScheduler:
         adam_opt: torch.optim.Optimizer,
         base_sigma: float,
         base_rho: float,
+        # New canonical knobs
+        sigma_method: str = 'ogd',
+        ogd_eta_u: float = 0.05,
+        ogd_eta_u_decay: str = 'textbook_sc',
+        ogd_G_clip: float = 10.0,
+        sigma_min_canonical: float = 1e-3,
+        sigma_max_canonical: float = 1e6,
+        lipschitz_ema_beta: float = 0.9,
+        lipschitz_window_size: int = 20,
+        lipschitz_min_dz: float = 1e-6,
+        lipschitz_max: float = 1e8,
+        lipschitz_floor_alpha: float = 1.0,
+        # Legacy task_aware knobs
         ema_beta: float = 0.9,
         eta_u: float = 0.05,
         sigma_min: float = 1e-4,
@@ -580,6 +653,33 @@ class SigmaRhoScheduler:
         self.base_sigma = float(base_sigma)
         self.base_rho = float(base_rho)
 
+        # Canonical knobs
+        self.sigma_method = sigma_method
+        self.ogd_eta_u = ogd_eta_u
+        self.ogd_eta_u_decay = ogd_eta_u_decay
+        self.ogd_G_clip = ogd_G_clip
+        self.sigma_min_canonical = sigma_min_canonical
+        self.sigma_max_canonical = sigma_max_canonical
+        self.lipschitz_ema_beta = lipschitz_ema_beta
+        self.lipschitz_window_size = lipschitz_window_size
+        self.lipschitz_min_dz = lipschitz_min_dz
+        self.lipschitz_max = lipschitz_max
+        self.lipschitz_floor_alpha = lipschitz_floor_alpha
+
+        # Lipschitz state (consumed only by 'ogd_lipschitz')
+        self.L_hat_ema = 0.0
+        self.L_hat_buffer = []
+        self.prev_grad_flat = None
+        self.prev_z_flat = None
+        self.last_L_hat_raw = None
+        self.last_floor_active = False
+
+        # Counter for the OGD step decay; increments once per OGD update fire
+        # so textbook_sc = 1/(2*k_sigma) reflects the number of OGD steps,
+        # matching _online.py's eta_u_decay='textbook_sc' semantics.
+        self.k_sigma = 0
+
+        # Legacy task-aware state
         self.ema_beta = ema_beta
         self.eta_u = eta_u
         self.sigma_min = sigma_min
@@ -595,7 +695,7 @@ class SigmaRhoScheduler:
         self.sigma_adapt_mode = sigma_adapt_mode
         self.task_lambda = task_lambda
 
-        # fixed ratio rho / sigma
+        # fixed ratio rho / sigma (used when scaling rho with sigma)
         self.rho_over_sigma = self.base_rho / max(self.base_sigma, eps)
 
         self.step_num = 0
@@ -609,7 +709,7 @@ class SigmaRhoScheduler:
         self.ta_task_loss = None
         self.ta_loss_increase = None
 
-        # initialize log-sigma around the base schedule
+        # initialize log-sigma at the configured base
         self.log_sigma = math.log(max(self.base_sigma, self.eps))
 
     def _base_schedule(self):
@@ -619,18 +719,110 @@ class SigmaRhoScheduler:
         rho_base = scale * self.base_rho
         return sigma_base, rho_base
 
+    def update_lipschitz(self, grad_flat, z_flat):
+        """Update L_hat from BB ratio ‖dg‖/‖dz‖ across consecutive ADMM rounds.
+
+        Mirrors `_online.py`'s online_convex_bal_lipschitz BB-grad estimator:
+        - grad_flat: Σ_i ∇F_i(z^k), already SUM-reduced across ranks by the caller.
+        - z_flat:    flattened global params at z^k (= W_global^k).
+
+        Call ONCE per training step, BEFORE optimizer2_2.step() (which mutates z).
+        Stores (z_flat, grad_flat) as the new "prev" pair for next round.
+        """
+        if self.prev_grad_flat is not None and self.prev_z_flat is not None:
+            dz = z_flat - self.prev_z_flat
+            dz_norm = float(dz.norm().item())
+            if dz_norm >= self.lipschitz_min_dz:
+                dg = grad_flat - self.prev_grad_flat
+                dg_norm = float(dg.norm().item())
+                L_hat_raw = min(dg_norm / dz_norm, self.lipschitz_max)
+                self.last_L_hat_raw = L_hat_raw
+                # EMA smoothing of the BB ratio
+                self.L_hat_ema = (self.lipschitz_ema_beta * self.L_hat_ema
+                                  + (1.0 - self.lipschitz_ema_beta) * L_hat_raw)
+                self.L_hat_buffer.append(L_hat_raw)
+                if len(self.L_hat_buffer) > self.lipschitz_window_size:
+                    self.L_hat_buffer.pop(0)
+        self.prev_grad_flat = grad_flat.detach().clone()
+        self.prev_z_flat = z_flat.detach().clone()
+
+    def _set_sigma_rho(self, sigma_t, rho_t):
+        pg = self.dist_opt.param_groups[0]
+        pg["sigma_lr"] = float(sigma_t)
+        pg["rho_lr"] = float(rho_t)
+
     def step(self, train_loss=None):
         sigma_base, rho_base = self._base_schedule()
 
-        # start from base schedule if no residuals yet
-        sigma_t = sigma_base
-        rho_t = rho_base
+        # ---- 'original': LR-coupled fixed schedule, no residual feedback. ----
+        if self.sigma_method == 'original':
+            self._set_sigma_rho(sigma_base, rho_base)
+            self.step_num += 1
+            return
 
         primal = self.dist_opt.last_primal_res
         dual = self.dist_opt.last_dual_res
 
-        if primal is not None and dual is not None and (self.step_num % self.adapt_every == 0):
-            # EMA smoothing
+        # First step (no residuals yet): use base schedule.
+        if primal is None or dual is None:
+            self._set_sigma_rho(sigma_base, rho_base)
+            self.step_num += 1
+            return
+
+        # ---- 'ogd' / 'ogd_lipschitz': canonical OGD on (u - target)^2. ----
+        # Direct port of `online_convex_bal_update_u` from _online.py.
+        # No EMA on residuals (raw current-round values), no anchor, no
+        # trust region, no blending.
+        if self.sigma_method in ('ogd', 'ogd_lipschitz'):
+            target = math.log((primal + self.eps) / (dual + self.eps))
+            old_u = self.log_sigma
+
+            # eta schedule
+            self.k_sigma += 1
+            if self.ogd_eta_u_decay == 'textbook_sc':
+                # Parameter-free strongly-convex OGD step on 0.5 * (u - target)^2
+                # (mu = 1 here since the loss is 0.5 * (u-target)^2; gradient is
+                # (u-target); Lipschitz of gradient is 1; SC modulus is 1).
+                # _online.py uses 1/(2*k) for the (u-target)^2 form (mu=2);
+                # both shrink as O(1/k). We follow the (u-target)^2 convention
+                # for consistency: grad = 2*(u-target).
+                eta_eff = 1.0 / (2.0 * self.k_sigma)
+                grad_u = 2.0 * (old_u - target)
+            else:
+                eta_eff = self.ogd_eta_u
+                grad_u = 2.0 * (old_u - target)
+            grad_u = max(-self.ogd_G_clip, min(self.ogd_G_clip, grad_u))
+            u_raw = old_u - eta_eff * grad_u
+
+            # Lipschitz floor (hard projection) for ogd_lipschitz
+            self.last_floor_active = False
+            if self.sigma_method == 'ogd_lipschitz' and self.L_hat_ema > 0.0:
+                log_floor = (math.log(max(self.L_hat_ema, self.eps))
+                             + math.log(max(self.lipschitz_floor_alpha, self.eps)))
+                if u_raw < log_floor:
+                    u_raw = log_floor
+                    self.last_floor_active = True
+
+            # Projection to [log_min, log_max]
+            u_new = min(max(u_raw, math.log(self.sigma_min_canonical)),
+                        math.log(self.sigma_max_canonical))
+            self.log_sigma = u_new
+
+            sigma_t = math.exp(u_new)
+            rho_t = self.rho_over_sigma * sigma_t
+            self._set_sigma_rho(sigma_t, rho_t)
+            self.step_num += 1
+            return
+
+        # ---- 'task_aware' (legacy): anchored task-aware mode. ----
+        # Kept for backward compat with `train_gpt2_medium_task_aware.py` only.
+        # The anchored convex_bal mode that used to live here was REMOVED on
+        # 2026-05-02; use sigma_method='ogd' for canonical convex-bal instead.
+        sigma_t = sigma_base
+        rho_t = rho_base
+
+        if self.sigma_method == 'task_aware' and (self.step_num % self.adapt_every == 0):
+            # EMA smoothing on residuals (legacy behavior)
             if self.primal_ema is None:
                 self.primal_ema = float(primal)
                 self.dual_ema = float(dual)
@@ -640,84 +832,42 @@ class SigmaRhoScheduler:
 
             primal_smooth = self.primal_ema
             dual_smooth = self.dual_ema
-
-            # imbalance: positive means primal > dual, so increase sigma
             imbalance = math.log((primal_smooth + self.eps) / (dual_smooth + self.eps))
-
             old_u = self.log_sigma
             base_u = math.log(max(sigma_base, self.eps))
 
-            if self.sigma_adapt_mode == 'convex_bal':
-                # deadband late in training
-                if not (self.step_num >= self.stabilize_start and abs(imbalance) < self.deadband):
-                    # convex-bal style target: correct around the LR-coupled base schedule
-                    # positive imbalance -> larger sigma, negative imbalance -> smaller sigma
-                    eta_k = self.eta_u / math.sqrt(self.step_num + 1.0)
-                    u_candidate = base_u + eta_k * imbalance
+            target_u = base_u + imbalance
+            diff = old_u - target_u
+            grad_residual = 2.0 * diff
 
-                    # shrinking trust region
-                    max_delta_k = max(self.max_delta_min, self.max_delta / math.sqrt(self.step_num + 1.0))
-                    u_candidate = min(max(u_candidate, old_u - max_delta_k), old_u + max_delta_k)
+            loss_increase = 0.0
+            if train_loss is not None:
+                cur_loss = float(train_loss)
+                if self.prev_train_loss is not None:
+                    loss_increase = max(0.0, cur_loss - self.prev_train_loss)
+                self.prev_train_loss = cur_loss
 
-                    # damped blending
-                    blend_k = max(self.blend_min, self.blend / math.sqrt(self.step_num + 1.0))
-                    u_new = (1.0 - blend_k) * old_u + blend_k * u_candidate
+            grad_task = loss_increase * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
+            grad_u = grad_residual + self.task_lambda * grad_task
+            grad_u = max(-10.0, min(10.0, grad_u))
 
-                    # projection
-                    u_new = min(max(u_new, math.log(self.sigma_min)), math.log(self.sigma_max))
-                    self.log_sigma = u_new
+            eta_k = self.eta_u / math.sqrt(self.step_num + 1.0)
+            u_new = old_u - eta_k * grad_u
 
-            elif self.sigma_adapt_mode == 'task_aware':
-                # Task-aware online loss:
-                # L(u) = (u - target)^2 + task_lambda * relu(loss_curr - loss_prev) * |u - target|
-                # target = base_u + imbalance (same direction as convex_bal)
-                target_u = base_u + imbalance
-                diff = old_u - target_u
+            max_delta_k = max(self.max_delta_min, self.max_delta / math.sqrt(self.step_num + 1.0))
+            u_new = min(max(u_new, old_u - max_delta_k), old_u + max_delta_k)
+            u_new = min(max(u_new, math.log(self.sigma_min)), math.log(self.sigma_max))
+            self.log_sigma = u_new
 
-                # Residual balance gradient
-                grad_residual = 2.0 * diff
-
-                # Task-awareness gradient: activated when train loss increases
-                loss_increase = 0.0
-                if train_loss is not None:
-                    cur_loss = float(train_loss)
-                    if self.prev_train_loss is not None:
-                        loss_increase = max(0.0, cur_loss - self.prev_train_loss)
-                    self.prev_train_loss = cur_loss
-
-                grad_task = loss_increase * (1.0 if diff > 0 else (-1.0 if diff < 0 else 0.0))
-
-                # Combined gradient
-                grad_u = grad_residual + self.task_lambda * grad_task
-                grad_u = max(-10.0, min(10.0, grad_u))  # clip
-
-                eta_k = self.eta_u / math.sqrt(self.step_num + 1.0)
-                u_new = old_u - eta_k * grad_u
-
-                # shrinking trust region (same as convex_bal)
-                max_delta_k = max(self.max_delta_min, self.max_delta / math.sqrt(self.step_num + 1.0))
-                u_new = min(max(u_new, old_u - max_delta_k), old_u + max_delta_k)
-
-                # projection
-                u_new = min(max(u_new, math.log(self.sigma_min)), math.log(self.sigma_max))
-                self.log_sigma = u_new
-
-                # diagnostics for wandb
-                self.ta_res_loss = diff ** 2
-                self.ta_task_loss = loss_increase * abs(diff)
-                self.ta_total_loss = self.ta_res_loss + self.task_lambda * self.ta_task_loss
-                self.ta_loss_increase = loss_increase
+            self.ta_res_loss = diff ** 2
+            self.ta_task_loss = loss_increase * abs(diff)
+            self.ta_total_loss = self.ta_res_loss + self.task_lambda * self.ta_task_loss
+            self.ta_loss_increase = loss_increase
 
             sigma_t = math.exp(self.log_sigma)
-
-            # keep rho proportional to sigma, preserving your original scheduler structure
-            # but centered around the current adaptive sigma, not purely the Adam lr
             rho_t = self.rho_over_sigma * sigma_t
 
-        pg = self.dist_opt.param_groups[0]
-        pg["sigma_lr"] = float(sigma_t)
-        pg["rho_lr"] = float(rho_t)
-
+        self._set_sigma_rho(sigma_t, rho_t)
         self.step_num += 1
         
 # -----------------------------------------------------------------------------
@@ -981,11 +1131,42 @@ class Hyperparameters:
     admm_mode: str = 'linearized'  # 'linearized' or 'exact'
     admm_inner_steps: int = 5      # inner loop steps for exact ADMM
     admm_inner_lr: float = 1e-3    # inner loop lr for exact ADMM
-    sigma_adapt_mode: str = 'convex_bal'  # 'convex_bal' or 'task_aware'
+    sigma_adapt_mode: str = 'convex_bal'  # legacy: 'convex_bal' or 'task_aware'
     task_lambda: float = 1.0       # weight of task-awareness term
 
-args = Hyperparameters(admm_mode=admm_mode, admm_inner_steps=admm_inner_steps, admm_inner_lr=admm_inner_lr,
-                       sigma_adapt_mode=sigma_adapt_mode, task_lambda=task_lambda)
+    # ---- Canonical sigma rule (matches _online.py) ----
+    sigma_method: str = 'ogd'      # 'original' | 'ogd' | 'ogd_lipschitz' | 'task_aware'
+    ogd_eta_u: float = 0.05
+    ogd_eta_u_decay: str = 'textbook_sc'
+    ogd_G_clip: float = 10.0
+    sigma_min_canonical: float = 1e-3
+    sigma_max_canonical: float = 1e6
+    lipschitz_ema_beta: float = 0.9
+    lipschitz_window_size: int = 20
+    lipschitz_min_dz: float = 1e-6
+    lipschitz_max: float = 1e8
+    lipschitz_floor_alpha: float = 1.0
+
+args = Hyperparameters(
+    sigma_lr=sigma_lr,
+    rho_lr=rho_lr,
+    admm_mode=admm_mode,
+    admm_inner_steps=admm_inner_steps,
+    admm_inner_lr=admm_inner_lr,
+    sigma_adapt_mode=sigma_adapt_mode,
+    task_lambda=task_lambda,
+    sigma_method=sigma_method,
+    ogd_eta_u=ogd_eta_u,
+    ogd_eta_u_decay=ogd_eta_u_decay,
+    ogd_G_clip=ogd_G_clip,
+    sigma_min_canonical=sigma_min_canonical,
+    sigma_max_canonical=sigma_max_canonical,
+    lipschitz_ema_beta=lipschitz_ema_beta,
+    lipschitz_window_size=lipschitz_window_size,
+    lipschitz_min_dz=lipschitz_min_dz,
+    lipschitz_max=lipschitz_max,
+    lipschitz_floor_alpha=lipschitz_floor_alpha,
+)
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
@@ -1025,6 +1206,19 @@ sched_sigma_rho = SigmaRhoScheduler(
     optimizer1,
     base_sigma=args.sigma_lr,
     base_rho=args.rho_lr,
+    # Canonical OGD / Lipschitz knobs (matching _online.py)
+    sigma_method=args.sigma_method,
+    ogd_eta_u=args.ogd_eta_u,
+    ogd_eta_u_decay=args.ogd_eta_u_decay,
+    ogd_G_clip=args.ogd_G_clip,
+    sigma_min_canonical=args.sigma_min_canonical,
+    sigma_max_canonical=args.sigma_max_canonical,
+    lipschitz_ema_beta=args.lipschitz_ema_beta,
+    lipschitz_window_size=args.lipschitz_window_size,
+    lipschitz_min_dz=args.lipschitz_min_dz,
+    lipschitz_max=args.lipschitz_max,
+    lipschitz_floor_alpha=args.lipschitz_floor_alpha,
+    # Legacy task_aware knobs
     ema_beta=0.9,
     eta_u=0.02,
     sigma_min=1e-3,
@@ -1143,6 +1337,28 @@ def train():
             for p in model.parameters():
                     p.grad /= gradient_accumulation_steps
 
+            # ---- BB Lipschitz floor: capture (z^k, ∇F(z^k)) BEFORE optimizer2_2.step() ----
+            # The forward+backward above produced per-rank task gradients in p.grad.
+            # We need Σ_i ∇F_i(z^k) summed across ranks. Do a non-destructive
+            # all-reduce on a flat clone so the SISA local solve still sees its
+            # original per-rank p.grad. Only fires for ogd_lipschitz mode.
+            if args.sigma_method == 'ogd_lipschitz':
+                tparams = [pp for pp in raw_model.transformer.h.parameters()]
+                grad_chunks = []
+                z_chunks = []
+                for pp in tparams:
+                    if pp.grad is not None:
+                        grad_chunks.append(pp.grad.detach().flatten().to(torch.float32))
+                    else:
+                        grad_chunks.append(torch.zeros(pp.numel(), device=pp.device, dtype=torch.float32))
+                    z_chunks.append(pp.detach().flatten().to(torch.float32))
+                flat_grad = torch.cat(grad_chunks)
+                flat_z = torch.cat(z_chunks)
+                if dist.is_initialized():
+                    dist.all_reduce(flat_grad, op=dist.ReduceOp.SUM)
+                sched_sigma_rho.update_lipschitz(flat_grad, flat_z)
+                del grad_chunks, z_chunks, flat_grad, flat_z
+
             optimizer2_2.step()
 
 
@@ -1191,6 +1407,16 @@ def train():
                     log_dict["admm/ta_residual_loss"] = sched_sigma_rho.ta_res_loss
                     log_dict["admm/ta_task_loss"] = sched_sigma_rho.ta_task_loss
                     log_dict["admm/ta_loss_increase"] = sched_sigma_rho.ta_loss_increase
+                # Canonical OGD / Lipschitz diagnostics
+                log_dict["admm/sigma_method"] = args.sigma_method
+                log_dict["admm/k_sigma"] = sched_sigma_rho.k_sigma
+                log_dict["admm/log_sigma"] = sched_sigma_rho.log_sigma
+                if args.sigma_method == 'ogd_lipschitz':
+                    log_dict["admm/L_hat_ema"] = sched_sigma_rho.L_hat_ema
+                    if sched_sigma_rho.last_L_hat_raw is not None:
+                        log_dict["admm/L_hat_raw"] = sched_sigma_rho.last_L_hat_raw
+                    log_dict["admm/floor_active"] = float(sched_sigma_rho.last_floor_active)
+                    log_dict["admm/L_hat_buffer_size"] = len(sched_sigma_rho.L_hat_buffer)
                 wandb.log(log_dict, step=step)
 
         iter_num += 1
