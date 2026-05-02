@@ -154,9 +154,15 @@ def get_args():
     parser.add_argument('--device', type=str, default='cuda:0', help='The device to run the program')
     parser.add_argument('--log_file_name', type=str, default=None, help='The log file name')
     parser.add_argument('--optimizer', type=str, default='sgd',
-                        help="the optimizer: 'sgd', 'adam', 'amsgrad', or "
-                             "'adam_warmstart' (Adam with m, v, t persisted across "
-                             "ADMM rounds via per-client optimizer_states).")
+                        help="the optimizer for the local solve: 'sgd', 'adam', "
+                             "'amsgrad', 'adam_warmstart' (Adam with m, v, t "
+                             "persisted across ADMM rounds), 'adamw_admm_explicit' "
+                             "(Adam on task gradient only; ADMM regularizer applied "
+                             "as a decoupled per-batch/epoch/round step a la "
+                             "AdamW; cold m, v, t each round), or "
+                             "'adamw_admm_explicit_warmstart' (same decoupled "
+                             "regularizer but persists Adam's m, v, t across "
+                             "rounds).")
     parser.add_argument('--local_init', type=str, default='reset',
                         choices=['reset', 'warm'],
                         help="How to initialize the local solve at each ADMM round: "
@@ -167,6 +173,13 @@ def get_args():
     # NOTE (2026-04-27, REMOVED): --admm_reg_lr was used for the AdamW-style
     # decoupled-regularizer optimizers (adamw_admm_explicit, adamw_admm_implicit).
     # Both variants were reverted -- see local_admm_train docstring CHANGE LOG.
+    #
+    # NOTE (2026-05-02, RE-INTRODUCED without the knob): adamw_admm_explicit
+    # and adamw_admm_explicit_warmstart now hard-code eta_r = args.lr / max(sigma, 1)
+    # applied per batch. The sigma-invariant scaling (inv_sigma) is the
+    # fundamental fix for the prior collapse pathology -- it is not a tunable
+    # because eta_r * alpha * sigma without inv_sigma diverges at our sigma_0
+    # range. No new flags. See local_admm_train docstring CHANGE LOG entry.
     parser.add_argument('--mu', type=float, default=0.001, help='the mu parameter for fedprox')
     parser.add_argument('--noise', type=float, default=0, help='how much noise we add to some party')
     parser.add_argument('--noise_type', type=str, default='level', help='Different level of noise or different space of noise')
@@ -1101,9 +1114,29 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     Reverted both adamw_admm_* variants. See pilot file
     generate_and_run_sisa_jobs_adamw_pilot.py for the failed launch.
 
+    CHANGE LOG (2026-05-02, RE-INTRODUCED with sigma-invariant fix): the
+    explicit decoupled-regularizer variant is back as 'adamw_admm_explicit'
+    (cold m, v, t each round) and 'adamw_admm_explicit_warmstart' (Adam
+    state persisted across rounds via optimizer_states, mirroring
+    'adam_warmstart' plumbing).
+
+    The fix: the reg-step size is hard-coded to
+        eta_r = args.lr / max(sigma, 1)
+    so per-batch shrinkage rate
+        eta_r * alpha * sigma = args.lr * alpha
+    is sigma-invariant (~1e-4 at args.lr=1e-3, alpha~0.1). Cumulative
+    shrinkage over ep=10 (~1000 batches) is bounded at ~10%, well below
+    the prior ~100% collapse at sigma=1e4. AdamW-faithful: applied per
+    batch alongside the Adam step, never per-epoch / per-round (those
+    were considered as workarounds but reduce nothing -- per-application
+    rate stays the same and the implementation is no longer AdamW). No
+    new flags; eta_r is tied to args.lr and the inv_sigma scaling is
+    fundamental, not optional.
+
     Returns:
-        (params, avg_loss) for sgd/adam/amsgrad
-        (params, avg_loss, optimizer_state_dict) for adam_warmstart
+        (params, avg_loss) for sgd/adam/amsgrad/adamw_admm_explicit
+        (params, avg_loss, optimizer_state_dict) for adam_warmstart and
+        adamw_admm_explicit_warmstart
     """
     # ----- Initialization: reset (default) or warm-start (opt-in) -----
     local_init = getattr(args, "local_init", "reset")
@@ -1129,14 +1162,34 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         optimizer = optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.reg, amsgrad=True)
     elif args.optimizer == 'sgd':
         optimizer = optim.SGD(model.parameters(), lr=args.lr, momentum=args.rho, weight_decay=args.reg)
+    elif args.optimizer == 'adamw_admm_explicit':
+        # Cold m, v, t each round. Adam sees task gradient only; the
+        # ADMM regularizer is applied as a decoupled per-batch step
+        # below (see training loop).
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    elif args.optimizer == 'adamw_admm_explicit_warmstart':
+        # Same decoupled regularizer as adamw_admm_explicit, but Adam's
+        # m, v, t persist across ADMM rounds via optimizer_states[sb].
+        optimizer = optim.Adam(model.parameters(), lr=args.lr)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
     else:
         raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+    is_adamw_decoupled = args.optimizer in (
+        'adamw_admm_explicit', 'adamw_admm_explicit_warmstart',
+    )
 
     criterion = nn.CrossEntropyLoss().to(device)
     model.train()
 
     epoch_loss = 0.0
     n_batches = 0
+
+    # AdamW-decoupled reg-step coefficient: eta_r = args.lr / max(sigma, 1).
+    # Per-batch shrinkage rate eta_r * alpha * sigma = args.lr * alpha is
+    # sigma-invariant, which is what fixes the prior collapse pathology.
+    adamw_eta_r = args.lr / max(sigma_lr, 1.0) if is_adamw_decoupled else 0.0
 
     for _ in range(args.epochs):
         for x, target in train_dl_local:
@@ -1153,19 +1206,34 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
                 dual_term = dual_term + torch.sum(pi * diff)
                 quad_term = quad_term + 0.5 * sigma_lr * torch.sum(diff * diff)
 
-            # alpha_i scales the whole augmented Lagrangian.
-            loss = alpha_i * (task_loss + dual_term + quad_term)
-            loss.backward()
+            if is_adamw_decoupled:
+                # AdamW-style: Adam sees ONLY the task gradient.
+                backprop_loss = alpha_i * task_loss
+            else:
+                # Coupled: Adam sees the full augmented Lagrangian.
+                backprop_loss = alpha_i * (task_loss + dual_term + quad_term)
+
+            backprop_loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
 
-            epoch_loss += loss.item()
+            if is_adamw_decoupled:
+                # Decoupled per-batch ADMM regularizer step (post-Adam):
+                #   w <- w - eta_r * alpha_i * (pi + sigma * (w - w_g))
+                with torch.no_grad():
+                    for p, wg, pi in zip(model.parameters(), w_global, pi_local):
+                        p.sub_(adamw_eta_r * alpha_i * (pi + sigma_lr * (p - wg)))
+
+            # Logging always reflects the full augmented-Lagrangian loss
+            # so train_local_admm_loss_avg is comparable across optimizers.
+            full_loss = alpha_i * (task_loss + dual_term + quad_term)
+            epoch_loss += float(full_loss.item())
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
     params = [p.detach().clone() for p in model.parameters()]
 
-    if args.optimizer == 'adam_warmstart':
+    if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit_warmstart'):
         return params, avg_loss, optimizer.state_dict()
     return params, avg_loss
 
@@ -1716,7 +1784,7 @@ if __name__ == '__main__':
                     optimizer_state=optimizer_states[sb]
                 )
 
-                if args.optimizer == 'adam_warmstart':
+                if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit_warmstart'):
                     W_i_new, avg_local_loss, optimizer_states[sb] = result
                 else:
                     W_i_new, avg_local_loss = result
