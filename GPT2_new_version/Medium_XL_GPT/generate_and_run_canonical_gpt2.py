@@ -77,13 +77,15 @@ def build_command(size: str, method: str, sigma_lr: str, seed: int, nproc: int,
     tag = f"gpt2_{size}_{method}_sig{slug(sigma_lr)}_seed{seed}"
     save_root = "/dataMeR2/yutong/sisa_gpt2"
 
+    # NOTE: configurator.py expects --key=value (with -- prefix) for overrides;
+    # bare names are interpreted as config-file paths. See configurator.py L20-23.
     overrides = [
-        f"sigma_lr={sigma_lr}",
-        f"seed={seed}",
-        f"comment={tag}",
-        f"save_dir={save_root}/log_gpt2/{tag}",
-        f"out_dir={save_root}/out_gpt2/{tag}",
-        f"wandb_run_name={tag}",
+        f"--sigma_lr={sigma_lr}",
+        f"--seed={seed}",
+        f"--comment={tag}",
+        f"--save_dir={save_root}/log_gpt2/{tag}",
+        f"--out_dir={save_root}/out_gpt2/{tag}",
+        f"--wandb_run_name={tag}",
     ]
 
     prefix = f"CUDA_VISIBLE_DEVICES={gpus} " if gpus else ""
