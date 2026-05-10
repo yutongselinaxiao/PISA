@@ -113,7 +113,17 @@ def main():
                          "the env-var prefix entirely.")
     ap.add_argument("--medium-only", action="store_true")
     ap.add_argument("--xl-only", action="store_true")
+    ap.add_argument("--methods", type=str, default=None,
+                    help="comma-separated subset of methods to run (e.g. "
+                         "'ogd,ogd_lipschitz' to skip already-completed "
+                         "'original'). Default: all of {original, ogd, ogd_lipschitz}.")
     args = ap.parse_args()
+    methods = METHODS if args.methods is None else [
+        m.strip() for m in args.methods.split(",") if m.strip()
+    ]
+    unknown = [m for m in methods if m not in METHODS]
+    if unknown:
+        raise SystemExit(f"Unknown methods: {unknown}. Valid: {METHODS}")
     gpus = args.gpus.strip() or None
     # Sanity: warn if nproc and number of visible GPUs disagree.
     if gpus is not None:
@@ -138,7 +148,7 @@ def main():
     for size in sizes:
         info = SIZES[size]
         nproc = args.nproc_per_node or info["default_nproc"]
-        for method in METHODS:
+        for method in methods:
             for sigma_lr in info["sigma_lr_values"]:
                 for seed in SEEDS:
                     tag, cmd = build_command(size, method, sigma_lr, seed, nproc, gpus)

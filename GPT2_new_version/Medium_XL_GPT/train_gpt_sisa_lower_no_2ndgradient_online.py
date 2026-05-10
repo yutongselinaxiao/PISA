@@ -121,7 +121,12 @@ sigma_method = 'ogd'
 ogd_eta_u = 0.05
 ogd_eta_u_decay = 'textbook_sc'  # 'none' (constant ogd_eta_u) | 'textbook_sc' (= 1/(2*k))
 ogd_G_clip = 10.0
-sigma_min_canonical = 1e-3
+# σ floor for numerical stability of SISA aggregator (new_W = wpi/(σ+l2)).
+# Old default 1e-3 caused new_W to blow up at very small σ. 0.1 keeps new_W
+# bounded while still being 5+ decades below any planned σ_0 ∈ {1e1...1e6}.
+# Aligns with Theorem 1's premise σ_min > L̄ (proof requires this for the
+# rate constant 1/(σ_min - L̄) to be admissible).
+sigma_min_canonical = 0.1
 sigma_max_canonical = 1e6
 # BB Lipschitz floor (used only when sigma_method='ogd_lipschitz')
 lipschitz_ema_beta = 0.9
@@ -625,7 +630,7 @@ class SigmaRhoScheduler:
         ogd_eta_u: float = 0.05,
         ogd_eta_u_decay: str = 'textbook_sc',
         ogd_G_clip: float = 10.0,
-        sigma_min_canonical: float = 1e-3,
+        sigma_min_canonical: float = 0.1,
         sigma_max_canonical: float = 1e6,
         lipschitz_ema_beta: float = 0.9,
         lipschitz_window_size: int = 20,
@@ -732,19 +737,34 @@ class SigmaRhoScheduler:
         if self.prev_grad_flat is not None and self.prev_z_flat is not None:
             dz = z_flat - self.prev_z_flat
             dz_norm = float(dz.norm().item())
-            if dz_norm >= self.lipschitz_min_dz:
+            # NaN/Inf guard on dz_norm itself (very early in training a bad
+            # gradient can cascade): skip the BB sample if dz_norm is non-finite.
+            dz_finite = math.isfinite(dz_norm)
+            if dz_finite and dz_norm >= self.lipschitz_min_dz:
                 dg = grad_flat - self.prev_grad_flat
                 dg_norm = float(dg.norm().item())
-                L_hat_raw = min(dg_norm / dz_norm, self.lipschitz_max)
-                self.last_L_hat_raw = L_hat_raw
-                # EMA smoothing of the BB ratio
-                self.L_hat_ema = (self.lipschitz_ema_beta * self.L_hat_ema
-                                  + (1.0 - self.lipschitz_ema_beta) * L_hat_raw)
-                self.L_hat_buffer.append(L_hat_raw)
-                if len(self.L_hat_buffer) > self.lipschitz_window_size:
-                    self.L_hat_buffer.pop(0)
-        self.prev_grad_flat = grad_flat.detach().clone()
-        self.prev_z_flat = z_flat.detach().clone()
+                # NaN/Inf guard: a single bad gradient (often early in training
+                # before the model is in a smooth regime) can produce dg_norm =
+                # NaN/Inf, which then poisons L_hat_ema for the rest of training.
+                # Skip this sample instead of letting it corrupt the estimator.
+                # Required by Assumption 3 of adaptive_sigma_lipschitz_proof.tex
+                # — L_hat must be a real upper bound on L_obs.
+                if math.isfinite(dg_norm):
+                    raw_ratio = dg_norm / dz_norm
+                    if math.isfinite(raw_ratio):
+                        L_hat_raw = min(raw_ratio, self.lipschitz_max)
+                        self.last_L_hat_raw = L_hat_raw
+                        # EMA smoothing of the BB ratio
+                        self.L_hat_ema = (self.lipschitz_ema_beta * self.L_hat_ema
+                                          + (1.0 - self.lipschitz_ema_beta) * L_hat_raw)
+                        self.L_hat_buffer.append(L_hat_raw)
+                        if len(self.L_hat_buffer) > self.lipschitz_window_size:
+                            self.L_hat_buffer.pop(0)
+        # Only store new (z, grad) as prev if grad_flat is finite. Otherwise
+        # keep the old prev so the next valid grad still produces a usable BB pair.
+        if torch.isfinite(grad_flat).all() and torch.isfinite(z_flat).all():
+            self.prev_grad_flat = grad_flat.detach().clone()
+            self.prev_z_flat = z_flat.detach().clone()
 
     def _set_sigma_rho(self, sigma_t, rho_t):
         pg = self.dist_opt.param_groups[0]
@@ -1139,7 +1159,7 @@ class Hyperparameters:
     ogd_eta_u: float = 0.05
     ogd_eta_u_decay: str = 'textbook_sc'
     ogd_G_clip: float = 10.0
-    sigma_min_canonical: float = 1e-3
+    sigma_min_canonical: float = 0.1   # raised from 1e-3 (numerical stability + Theorem 1 premise)
     sigma_max_canonical: float = 1e6
     lipschitz_ema_beta: float = 0.9
     lipschitz_window_size: int = 20

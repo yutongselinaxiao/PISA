@@ -49,7 +49,7 @@ sigma_method = 'ogd'
 ogd_eta_u = 0.05
 ogd_eta_u_decay = 'textbook_sc'   # 1/(2*k_sigma)
 ogd_G_clip = 10.0
-sigma_min_canonical = 1e-3
+sigma_min_canonical = 0.1
 sigma_max_canonical = 1e6
 
 use_wandb = True
