@@ -432,8 +432,11 @@ def get_args():
     # adaptive rho mode
     parser.add_argument('--sigma_mode', type=str, default='fixed',
                     choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal',
-                             'online_convex_bal_lipschitz', 'online_task_aware'],
-                    help='sigma update mode for sisa')
+                             'online_convex_bal_lipschitz', 'online_task_aware',
+                             'floor_only'],
+                    help='sigma update mode for sisa. floor_only is the '
+                         'no-OGD ablation: σ_t = α·L̂_t directly, tracking the '
+                         'BB-Lipschitz estimate without an OGD step on residuals.')
 
     parser.add_argument('--sigma_min', type=float, default=1e-6,
                         help='minimum allowed sigma')
@@ -1622,7 +1625,8 @@ if __name__ == '__main__':
                 # NOTE: raw-sum gradient (no 1/num_batches scaling) -- only the
                 # *ratio* ||dg||/||dz|| matters for BB, and scaling is consistent
                 # across rounds as long as the dataloader pass is identical.
-                if sigma_mode == "online_convex_bal_lipschitz":
+                # `floor_only` (no-OGD ablation) also needs L̂, so include it here.
+                if sigma_mode in ("online_convex_bal_lipschitz", "floor_only"):
                     if grad_global_curr is None:
                         grad_global_curr = [
                             torch.zeros_like(g) if g is not None else None for g in gradients
@@ -1759,7 +1763,9 @@ if __name__ == '__main__':
             L_hat_tensor = None
 
             # BB Lipschitz update: needs previous round's grad and z, so only fires from epoch 1.
-            if sigma_mode == "online_convex_bal_lipschitz" and grad_global_curr is not None:
+            # `floor_only` (no-OGD ablation) also needs L̂, so include it here.
+            if (sigma_mode in ("online_convex_bal_lipschitz", "floor_only")
+                    and grad_global_curr is not None):
                 with torch.no_grad():
                     if grad_global_prev is not None:
                         dz_tensors = [a - b for a, b in zip(z_curr_bb, z_prev_bb)]
@@ -1929,6 +1935,25 @@ if __name__ == '__main__':
                     )
                     u_sigma = u_new
                     sigma_lr = float(torch.exp(u_new).item())
+
+                elif sigma_mode == "floor_only":
+                    # ABLATION: track BB Lipschitz L̂ and set σ_t = α·L̂_t directly,
+                    # with NO OGD step on residuals. Tests whether OGD is doing
+                    # work on top of the floor, or whether "follow L̂" alone matches
+                    # OGD+Lipschitz performance. The BB-grad pre-pass and L̂_ema
+                    # update happen in the same code paths as
+                    # online_convex_bal_lipschitz (above); the only change is that
+                    # σ is set directly to α·L̂ instead of via the OGD step.
+                    if L_hat_tensor is not None and L_hat_tensor.item() > 0:
+                        alpha = getattr(args, "lipschitz_floor_alpha", 1.0)
+                        sigma_lr_new = float(alpha * L_hat_tensor.item())
+                        sigma_lr = float(max(sigma_min, min(sigma_max, sigma_lr_new)))
+                        u_sigma = torch.tensor(math.log(max(sigma_lr, 1e-12)),
+                                                device=device)
+                        # Diagnostics for wandb (mimic the lipschitz mode keys)
+                        lf_log_L = torch.log(torch.clamp(L_hat_tensor, min=1e-12))
+                        lf_floor_active = torch.tensor(1.0, device=device)
+                    # else: σ unchanged (no L̂ sample yet)
 
                 elif sigma_mode == "online_task_aware":
                     cur_train_loss = epoch_train_loss / max(epoch_train_total, 1)
