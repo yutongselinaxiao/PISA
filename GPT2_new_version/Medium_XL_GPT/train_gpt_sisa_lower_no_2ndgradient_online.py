@@ -128,12 +128,15 @@ ogd_G_clip = 10.0
 # rate constant 1/(σ_min - L̄) to be admissible).
 sigma_min_canonical = 0.1
 sigma_max_canonical = 1e6
-# BB Lipschitz floor (used only when sigma_method='ogd_lipschitz')
+# BB Lipschitz floor (used only when sigma_method='ogd_lipschitz' or 'ogd_anchored_lipschitz')
 lipschitz_ema_beta = 0.9
 lipschitz_window_size = 20
 lipschitz_min_dz = 1e-6
 lipschitz_max = 1e8
 lipschitz_floor_alpha = 1.0
+# Anchored OGD: which residual to read. 'canonical' (Boyd RMS) or 'old'
+# (pre-2026-05-02 non-canonical form; informative on DDP-homogeneous).
+anchored_residual_source = 'canonical'
 flash_attn = True
 # wandb
 use_wandb = True
@@ -369,7 +372,8 @@ class DistributedOptimizer(torch.optim.Optimizer):
         self.max_steps = 5100
         self.epsilon_vv = 1e-15
         self.local_batch_size = None  # Will be set during training
-        self.last_primal_res = None
+        self.last_primal_res = None        # canonical RMS form (Boyd)
+        self.last_primal_res_old = None    # OLD non-canonical form (pre-2026-05-02; per-rank, no all-reduce)
         self.last_dual_res = None
 
         # Maintain original parameter shapes
@@ -556,27 +560,31 @@ class DistributedOptimizer(torch.optim.Optimizer):
         self._global_aggregate(updates_flat_w, local_w_list, prev_W_global, alpha_b)
 
     def _global_aggregate(self, updates_flat_w, local_w_list, prev_W_global, alpha_b):
-        """Global aggregation + canonical RMS residual computation.
+        """Global aggregation + TWO residual forms (canonical + old non-canonical).
 
-        Primal residual (canonical, matching `_online.py` post-2026-04-30):
-            ‖r‖_2 = sqrt(Σ_i α_i ‖w_i − w_g^{k+1}‖²)
+        Primal residuals:
+          - last_primal_res        = sqrt(Σ_i α_i ‖w_i − w_g^{k+1}‖²)  [canonical Boyd RMS]
+          - last_primal_res_old    = sqrt(Σ_layer ‖α_i·w_i − w_g^{k+1}‖²) per rank, no all-reduce
+                                     [historical non-canonical: artificially inflated on
+                                      DDP-homogeneous because (α_i−1)·w dominates the diff]
+
+        Both are stored so the σ-scheduler can choose which to consume. Canonical
+        is correct in the Boyd sense; OLD is what the pre-2026-05-02 anchored
+        convex_bal runs used to balance against (with informative signal on GPT-2).
+
         Dual residual:
-            ‖s‖_2 = σ · ‖w_g^{k+1} − w_g^k‖   (global-only; same on every rank)
-
-        Each rank contributes α_i · ‖w_i_local − new_W‖² (using the UNSCALED
-        local solution w_i stored in local_w_list); these contributions are
-        summed across ranks via all_reduce(SUM).
+          - last_dual_res = σ · ‖w_g^{k+1} − w_g^k‖  (global-only; identical on every rank)
         """
         sigma_lr = self.param_groups[0]['sigma_lr']
 
         dist.all_reduce(updates_flat_w, op=dist.ReduceOp.SUM)
 
         curr_idx = 0
-        # Per-rank contribution to canonical primal_sq: Σ_layer ‖w_i − new_W‖²
-        # (will be α_i-weighted then SUM-reduced across ranks below).
+        # Canonical: per-rank Σ_layer ‖w_i − new_W‖² (α-weighted + SUM-reduced below).
         local_primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
-        # dual_sq is global (depends on new_W and prev_W_global only) so all
-        # ranks compute the same value; no all-reduce needed.
+        # OLD non-canonical: per-rank Σ_layer ‖α_i·w_i − new_W‖² (no all-reduce; per-rank).
+        old_primal_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
+        # dual_sq is global (depends on new_W and prev_W_global only).
         dual_sq = torch.zeros(1, device=self.device, dtype=torch.float32)
 
         for i, para in enumerate(self.params):
@@ -584,18 +592,24 @@ class DistributedOptimizer(torch.optim.Optimizer):
 
             sigma_lr_i = sigma_lr
             new_W = wpi / (sigma_lr_i+self.args.l2_lambda)
-            local_primal_sq += ((local_w_list[i].to(torch.float32) - new_W.to(torch.float32)) ** 2).sum()
-            dual_sq += ((new_W.to(torch.float32) - prev_W_global[i].to(torch.float32)) ** 2).sum()
+            w_i_unscaled = local_w_list[i].to(torch.float32)
+            w_i_scaled = w_i_unscaled * float(alpha_b)
+            new_W_f32 = new_W.to(torch.float32)
+
+            local_primal_sq += ((w_i_unscaled - new_W_f32) ** 2).sum()
+            old_primal_sq += ((w_i_scaled - new_W_f32) ** 2).sum()
+            dual_sq += ((new_W_f32 - prev_W_global[i].to(torch.float32)) ** 2).sum()
 
             para.data.copy_(new_W)
-
             curr_idx += para.numel()
 
-        # Apply α_i-weighting to this rank's contribution, then SUM across ranks.
+        # Canonical: α-weight this rank's contribution, SUM-reduce across ranks.
         local_primal_sq = local_primal_sq * float(alpha_b)
         dist.all_reduce(local_primal_sq, op=dist.ReduceOp.SUM)
 
+        # OLD non-canonical: per-rank, no aggregation (matches pre-2026-05-02 behavior).
         self.last_primal_res = torch.sqrt(local_primal_sq + 1e-16).item()
+        self.last_primal_res_old = torch.sqrt(old_primal_sq + 1e-16).item()
         self.last_dual_res = (float(sigma_lr) * torch.sqrt(dual_sq + 1e-16)).item()
 
         self._step += 1
@@ -637,6 +651,11 @@ class SigmaRhoScheduler:
         lipschitz_min_dz: float = 1e-6,
         lipschitz_max: float = 1e8,
         lipschitz_floor_alpha: float = 1.0,
+        # Anchored-OGD: which primal residual to read from DistributedOptimizer.
+        # 'canonical' = Boyd RMS form (last_primal_res); 'old' = pre-2026-05-02
+        # per-rank α-scaled form (last_primal_res_old). The choice matters in
+        # DDP-homogeneous regimes where the canonical residual is tiny.
+        anchored_residual_source: str = 'canonical',
         # Legacy task_aware knobs
         ema_beta: float = 0.9,
         eta_u: float = 0.05,
@@ -670,6 +689,7 @@ class SigmaRhoScheduler:
         self.lipschitz_min_dz = lipschitz_min_dz
         self.lipschitz_max = lipschitz_max
         self.lipschitz_floor_alpha = lipschitz_floor_alpha
+        self.anchored_residual_source = anchored_residual_source
 
         # Lipschitz state (consumed only by 'ogd_lipschitz')
         self.L_hat_ema = 0.0
@@ -825,6 +845,103 @@ class SigmaRhoScheduler:
 
             # Projection to [log_min, log_max]
             u_new = min(max(u_raw, math.log(self.sigma_min_canonical)),
+                        math.log(self.sigma_max_canonical))
+            self.log_sigma = u_new
+
+            sigma_t = math.exp(u_new)
+            rho_t = self.rho_over_sigma * sigma_t
+            self._set_sigma_rho(sigma_t, rho_t)
+            self.step_num += 1
+            return
+
+        # ---- 'ogd_anchored' / 'ogd_anchored_lipschitz': OGD around LR-coupled anchor.
+        #
+        # Update rule (per step):
+        #   1. EMA-smooth primal/dual residuals (β = ema_beta).
+        #   2. Pick residual source (canonical or OLD non-canonical) per
+        #      `self.anchored_residual_source`.
+        #   3. imbalance = log(primal_ema / dual_ema)         # residual signal
+        #      base_u(t)  = log(σ_LR-coupled(t))               # anchor
+        #      η_k        = 1/(2k) under textbook_sc, else  ogd_eta_u / √k
+        #      target_u   = base_u + η_k · imbalance           # anchored target
+        #   4. OGD step on 0.5·(u − target)²: grad_u = 2·(u − target_u)
+        #      u_raw = u − η_k · grad_u, clamped to old_u ± max_delta_k (trust region)
+        #   5. Damped blend: u_new = (1−blend_k)·old + blend_k · u_raw
+        #   6. (+lipschitz only) project u_new ≥ log(α · L̂)
+        #   7. clamp(u_new, log σ_min, log σ_max), σ ← exp(u_new)
+        #
+        # Properties:
+        #   - Fixed point under blending: u_∞ ≈ base_u + η_k·imbalance → base_u as η_k → 0.
+        #   - Reduces to LR-coupled if imbalance is uninformative (canonical residual
+        #     on DDP-homogeneous → imbalance ≈ 0); strictly improves over LR-coupled
+        #     if imbalance is informative (e.g., OLD residual on GPT-2, or canonical
+        #     residual on non-iid FL).
+        if self.sigma_method in ('ogd_anchored', 'ogd_anchored_lipschitz'):
+            # 1. Pick which residual to use.
+            if self.anchored_residual_source == 'old':
+                primal_for_anchor = self.dist_opt.last_primal_res_old
+            else:  # 'canonical' (default)
+                primal_for_anchor = self.dist_opt.last_primal_res
+            if primal_for_anchor is None:
+                self._set_sigma_rho(sigma_base, rho_base)
+                self.step_num += 1
+                return
+
+            # 2. EMA-smooth the chosen residual + dual.
+            if self.primal_ema is None:
+                self.primal_ema = float(primal_for_anchor)
+                self.dual_ema = float(dual)
+            else:
+                self.primal_ema = (self.ema_beta * self.primal_ema
+                                   + (1.0 - self.ema_beta) * float(primal_for_anchor))
+                self.dual_ema = (self.ema_beta * self.dual_ema
+                                  + (1.0 - self.ema_beta) * float(dual))
+            primal_smooth = self.primal_ema
+            dual_smooth = self.dual_ema
+
+            imbalance = math.log((primal_smooth + self.eps) / (dual_smooth + self.eps))
+            old_u = self.log_sigma
+            base_u = math.log(max(sigma_base, self.eps))
+
+            # 3. OGD step size schedule.
+            self.k_sigma += 1
+            if self.ogd_eta_u_decay == 'textbook_sc':
+                eta_k = 1.0 / (2.0 * self.k_sigma)
+            else:
+                eta_k = self.ogd_eta_u / math.sqrt(self.k_sigma + 1.0)
+
+            # 4. Anchored target: σ should be near LR-coupled, with a residual-
+            # driven correction that decays as η_k → 0.
+            target_u = base_u + eta_k * imbalance
+
+            # 5. OGD step on 0.5·(u − target_u)² with G_clip-bounded gradient.
+            grad_u = 2.0 * (old_u - target_u)
+            grad_u = max(-self.ogd_G_clip, min(self.ogd_G_clip, grad_u))
+            u_raw = old_u - eta_k * grad_u
+
+            # 6. Trust region (shrinks over time): limit per-step |Δu| so a
+            # single noisy imbalance can't move σ too much.
+            max_delta_k = max(self.max_delta_min,
+                              self.max_delta / math.sqrt(self.k_sigma + 1.0))
+            u_raw = min(max(u_raw, old_u - max_delta_k), old_u + max_delta_k)
+
+            # 7. Damped blend (smooths trajectory; reduces noise from imbalance).
+            blend_k = max(self.blend_min,
+                           self.blend / math.sqrt(self.k_sigma + 1.0))
+            u_new = (1.0 - blend_k) * old_u + blend_k * u_raw
+
+            # 8. Lipschitz floor (hard projection) for the +lipschitz variant.
+            self.last_floor_active = False
+            if (self.sigma_method == 'ogd_anchored_lipschitz'
+                    and self.L_hat_ema > 0.0):
+                log_floor = (math.log(max(self.L_hat_ema, self.eps))
+                             + math.log(max(self.lipschitz_floor_alpha, self.eps)))
+                if u_new < log_floor:
+                    u_new = log_floor
+                    self.last_floor_active = True
+
+            # 9. Global projection to [σ_min, σ_max].
+            u_new = min(max(u_new, math.log(self.sigma_min_canonical)),
                         math.log(self.sigma_max_canonical))
             self.log_sigma = u_new
 
@@ -1155,7 +1272,8 @@ class Hyperparameters:
     task_lambda: float = 1.0       # weight of task-awareness term
 
     # ---- Canonical sigma rule (matches _online.py) ----
-    sigma_method: str = 'ogd'      # 'original' | 'ogd' | 'ogd_lipschitz' | 'task_aware'
+    sigma_method: str = 'ogd'      # 'original' | 'ogd' | 'ogd_lipschitz' | 'ogd_anchored' | 'ogd_anchored_lipschitz' | 'task_aware'
+    anchored_residual_source: str = 'canonical'   # for ogd_anchored*: 'canonical' or 'old'
     ogd_eta_u: float = 0.05
     ogd_eta_u_decay: str = 'textbook_sc'
     ogd_G_clip: float = 10.0
@@ -1176,6 +1294,7 @@ args = Hyperparameters(
     sigma_adapt_mode=sigma_adapt_mode,
     task_lambda=task_lambda,
     sigma_method=sigma_method,
+    anchored_residual_source=anchored_residual_source,
     ogd_eta_u=ogd_eta_u,
     ogd_eta_u_decay=ogd_eta_u_decay,
     ogd_G_clip=ogd_G_clip,
@@ -1228,6 +1347,7 @@ sched_sigma_rho = SigmaRhoScheduler(
     base_rho=args.rho_lr,
     # Canonical OGD / Lipschitz knobs (matching _online.py)
     sigma_method=args.sigma_method,
+    anchored_residual_source=args.anchored_residual_source,
     ogd_eta_u=args.ogd_eta_u,
     ogd_eta_u_decay=args.ogd_eta_u_decay,
     ogd_G_clip=args.ogd_G_clip,

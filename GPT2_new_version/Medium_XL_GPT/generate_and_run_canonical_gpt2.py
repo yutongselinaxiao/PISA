@@ -62,7 +62,13 @@ SIZES = {
     },
 }
 
-METHODS = ["original", "ogd", "ogd_lipschitz"]
+METHODS = [
+    "original",                  # LR-coupled fixed schedule, no σ-rule
+    "ogd",                       # canonical OGD on (u - log(primal/dual))²
+    "ogd_lipschitz",             # canonical OGD + BB-Lipschitz hard projection
+    "ogd_anchored_canonical",    # anchored OGD with Boyd-canonical residual
+    "ogd_anchored_old",          # anchored OGD with OLD non-canonical residual
+]
 SEEDS = [1337, 1338, 1339]
 
 
