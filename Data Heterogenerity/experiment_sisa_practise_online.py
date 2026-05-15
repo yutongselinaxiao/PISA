@@ -274,6 +274,63 @@ def global_norm(tensors):
         s = val if s is None else (s + val)
     return torch.sqrt(s + 1e-12)
 
+
+def global_dot(tensors_a, tensors_b):
+    # element-wise inner product across a list of same-shape tensor pairs.
+    # Returns scalar torch tensor on the same device.
+    s = None
+    for a, b in zip(tensors_a, tensors_b):
+        if a is None or b is None:
+            continue
+        val = (a.detach() * b.detach()).sum()
+        s = val if s is None else (s + val)
+    return s if s is not None else torch.tensor(0.0)
+
+
+def spectral_step(delta_h, delta_lambda, eps=1e-12):
+    """Xu-Figueiredo-Goldstein 2017 spectral stepsize.
+
+    Ports controllers.py:SpectralAADMM._spectral_step to torch lists.
+
+    Args:
+        delta_h:      list[Tensor]  change in primal-side quantity
+        delta_lambda: list[Tensor]  change in dual variable
+
+    Returns:
+        (step, cor) as Python floats. step is the BB-spectral candidate, cor
+        is the cosine correlation in [-1, 1]. step <= 0 or cor < threshold
+        signals an unreliable update -- caller applies the safeguard.
+    """
+    gn2 = 0.0
+    for a in delta_h:
+        if a is None:
+            continue
+        gn2 += float((a.detach() ** 2).sum().item())
+    dn2 = 0.0
+    for b in delta_lambda:
+        if b is None:
+            continue
+        dn2 += float((b.detach() ** 2).sum().item())
+    gn = math.sqrt(gn2 + eps)
+    dn = math.sqrt(dn2 + eps)
+    if gn <= eps or dn <= eps:
+        return 1.0, -1.0
+    dot = float(global_dot(delta_h, delta_lambda).item())
+    cor = dot / max(gn * dn, eps)
+    if dot <= eps:
+        return 1.0, cor
+    gg = gn2
+    dd = dn2
+    step_sd = dd / max(dot, eps)
+    step_mg = dot / max(gg, eps)
+    if step_sd <= eps or step_mg <= eps:
+        return 1.0, cor
+    if 2.0 * step_mg > step_sd:
+        step = step_mg
+    else:
+        step = step_sd - 0.5 * step_mg
+    return max(step, eps), cor
+
 def clip_scalar(x, lo, hi):
     return torch.clamp(x, min=lo, max=hi)
 
@@ -433,10 +490,13 @@ def get_args():
     parser.add_argument('--sigma_mode', type=str, default='fixed',
                     choices=['fixed', 'heuristic', 'online_balance', 'online_convex_bal',
                              'online_convex_bal_lipschitz', 'online_task_aware',
-                             'floor_only'],
+                             'floor_only', 'spectral_aadmm'],
                     help='sigma update mode for sisa. floor_only is the '
                          'no-OGD ablation: σ_t = α·L̂_t directly, tracking the '
-                         'BB-Lipschitz estimate without an OGD step on residuals.')
+                         'BB-Lipschitz estimate without an OGD step on residuals. '
+                         'spectral_aadmm is the Xu-Figueiredo-Goldstein (2017) '
+                         'spectral adaptive penalty (BB-style stepsize + '
+                         'correlation safeguard) ported from controllers.py.')
 
     parser.add_argument('--sigma_min', type=float, default=1e-6,
                         help='minimum allowed sigma')
@@ -501,6 +561,23 @@ def get_args():
                              'be a universal constant across experiments to preserve '
                              'the parameter-free property. See online_convex_bal_lipschitz_update_u '
                              'docstring for the 2026-04-24 design note.')
+
+    # spectral AADMM (Xu-Figueiredo-Goldstein 2017) -- only consumed when
+    # sigma_mode == 'spectral_aadmm'. Math is ported from
+    # controllers.py:SpectralAADMM. Inactive for all other modes.
+    parser.add_argument('--spectral_update_period', type=int, default=2,
+                        help='spectral_aadmm: update sigma once every this many '
+                             'eligible epochs (default 2, matches Xu et al.).')
+    parser.add_argument('--spectral_correlation_threshold', type=float, default=0.2,
+                        help='spectral_aadmm: safeguard. Only update sigma when '
+                             'cos(angle) between residual-change and dual-change '
+                             '> threshold. Default 0.2 from Xu et al.')
+    parser.add_argument('--spectral_sigma_min', type=float, default=1e-6,
+                        help='spectral_aadmm: lower bound on sigma after spectral '
+                             'step (independent of --sigma_min for clarity).')
+    parser.add_argument('--spectral_sigma_max', type=float, default=1e8,
+                        help='spectral_aadmm: upper bound on sigma after spectral '
+                             'step.')
 
     # numerical stability
     parser.add_argument('--eps', type=float, default=1e-8,
@@ -1532,6 +1609,25 @@ if __name__ == '__main__':
         # budget than freq=1 and fails to descend from large sigma_0.
         sigma_update_step = 0
 
+        # ---- State for spectral_aadmm (Xu-Figueiredo-Goldstein 2017) ----
+        # Snapshots of (h, g, lambda_hat, lambda) at the previous spectral
+        # evaluation epoch. All None until the first epoch fires; only
+        # consumed when sigma_mode == 'spectral_aadmm'.
+        spec_h_prev = None
+        spec_g_prev = None
+        spec_lambda_hat_prev = None
+        spec_lambda_prev = None
+        spec_update_period = getattr(args, "spectral_update_period", 2)
+        spec_cor_thresh = getattr(args, "spectral_correlation_threshold", 0.2)
+        spec_sigma_min = getattr(args, "spectral_sigma_min", 1e-6)
+        spec_sigma_max = getattr(args, "spectral_sigma_max", 1e8)
+        # Diagnostics for wandb logging.
+        spec_alpha_step = None
+        spec_beta_step = None
+        spec_alpha_cor = None
+        spec_beta_cor = None
+        spec_reason = None
+
         # ---- Total-variation accumulators (path-length proxy).
         # Validates the bounded-variation theorem in
         # notes/lipschitz_floor_bounded_variation.tex: check whether
@@ -1682,6 +1778,39 @@ if __name__ == '__main__':
                 )
                 for param, w in zip(model.parameters(), W_global):
                     param.copy_(w)
+
+            # ---- Spectral AADMM: snapshot end-of-epoch primal/dual quantities ----
+            # The SISA π-update at line ~1658 produces π_hat = π_old + σ·(w_i − w_g^{k-1})
+            # at the per-client level. After W_global aggregation just above,
+            # π_final = π_hat − σ·(w_g^{k} − w_g^{k-1}) (standard ADMM dual recovery).
+            # α-aggregated to the global level (Σ α_i = 1):
+            #   h_curr         = Σ α_i · w_i^{k+1}
+            #   g_curr         = -w_g^{k+1}
+            #   lambda_hat_curr = Σ α_i · π_hat_i
+            #   lambda_curr    = lambda_hat_curr − σ·(w_g^{k+1} − w_g^{k})
+            # Only computed when sigma_mode == 'spectral_aadmm' (cheap to skip).
+            spec_h_curr = None
+            spec_g_curr = None
+            spec_lambda_hat_curr = None
+            spec_lambda_curr = None
+            if sigma_mode == "spectral_aadmm":
+                with torch.no_grad():
+                    # h_curr = sum_i alpha_i * W_b_initial[i][j]   (per-param j)
+                    spec_h_curr = []
+                    spec_lambda_hat_curr = []
+                    for j in range(len(W_global)):
+                        h_j = torch.zeros_like(W_global[j])
+                        lam_hat_j = torch.zeros_like(W_global[j])
+                        for i in range(args.n_parties):
+                            h_j.add_(alpha_b[i] * W_b_initial[i][j].detach())
+                            lam_hat_j.add_(alpha_b[i] * P_b_initial[i][j].detach())
+                        spec_h_curr.append(h_j)
+                        spec_lambda_hat_curr.append(lam_hat_j)
+                    spec_g_curr = [-w.detach().clone() for w in W_global]
+                    spec_lambda_curr = [
+                        lam_hat_j - sigma_lr * (W_global[j] - W_global_prev[j])
+                        for j, lam_hat_j in enumerate(spec_lambda_hat_curr)
+                    ]
 
             # compute epoch-level averaged residuals
             #
@@ -1955,6 +2084,54 @@ if __name__ == '__main__':
                         lf_floor_active = torch.tensor(1.0, device=device)
                     # else: σ unchanged (no L̂ sample yet)
 
+                elif sigma_mode == "spectral_aadmm":
+                    # Xu-Figueiredo-Goldstein 2017 spectral AADMM.
+                    # Update sigma every spectral_update_period eligible epochs,
+                    # using BB-style stepsize from (Δh, Δλ_hat) and (Δg, Δλ),
+                    # gated by a correlation safeguard. Math ported from
+                    # controllers.py:SpectralAADMM (verified inert -- not imported).
+                    spec_alpha_step = None
+                    spec_beta_step = None
+                    spec_alpha_cor = None
+                    spec_beta_cor = None
+                    spec_reason = "wait"
+                    if (spec_h_prev is not None
+                            and (sigma_update_step % spec_update_period == 0)):
+                        d_h = [a - b for a, b in zip(spec_h_curr, spec_h_prev)]
+                        d_g = [a - b for a, b in zip(spec_g_curr, spec_g_prev)]
+                        d_lam_hat = [a - b for a, b in zip(
+                            spec_lambda_hat_curr, spec_lambda_hat_prev)]
+                        d_lam = [a - b for a, b in zip(
+                            spec_lambda_curr, spec_lambda_prev)]
+                        spec_alpha_step, spec_alpha_cor = spectral_step(d_h, d_lam_hat)
+                        spec_beta_step, spec_beta_cor = spectral_step(d_g, d_lam)
+
+                        sigma_new = sigma_lr
+                        spec_reason = "reject"
+                        a_ok = spec_alpha_cor > spec_cor_thresh
+                        b_ok = spec_beta_cor > spec_cor_thresh
+                        if a_ok and b_ok:
+                            sigma_new = math.sqrt(max(spec_alpha_step * spec_beta_step,
+                                                      0.0))
+                            spec_reason = "geometric"
+                        elif a_ok:
+                            sigma_new = spec_alpha_step
+                            spec_reason = "alpha"
+                        elif b_ok:
+                            sigma_new = spec_beta_step
+                            spec_reason = "beta"
+                        sigma_lr = float(min(max(sigma_new, spec_sigma_min),
+                                              spec_sigma_max))
+                        u_sigma = torch.tensor(math.log(max(sigma_lr, 1e-12)),
+                                                device=device)
+
+                    # Rotate snapshots regardless of whether we updated this
+                    # round -- prev should always hold the most recent eval.
+                    spec_h_prev = spec_h_curr
+                    spec_g_prev = spec_g_curr
+                    spec_lambda_hat_prev = spec_lambda_hat_curr
+                    spec_lambda_prev = spec_lambda_curr
+
                 elif sigma_mode == "online_task_aware":
                     cur_train_loss = epoch_train_loss / max(epoch_train_total, 1)
                     # Use previous loss; on first update, treat as no change
@@ -2071,6 +2248,20 @@ if __name__ == '__main__':
                     for j, name in enumerate(param_names_bb):
                         if L_hat_ema_per_layer[j] > 0:
                             log_dict[f"sigma/L_hat_per_layer/{name}"] = L_hat_ema_per_layer[j]
+
+                elif sigma_mode == "spectral_aadmm":
+                    if spec_alpha_step is not None:
+                        log_dict["sigma/spec_alpha_step"] = float(spec_alpha_step)
+                        log_dict["sigma/spec_beta_step"] = float(spec_beta_step)
+                        log_dict["sigma/spec_alpha_cor"] = float(spec_alpha_cor)
+                        log_dict["sigma/spec_beta_cor"] = float(spec_beta_cor)
+                    if spec_reason is not None:
+                        # encode reason as a small integer for easy plotting
+                        reason_codes = {"wait": 0, "reject": 1, "geometric": 2,
+                                        "alpha": 3, "beta": 4}
+                        log_dict["sigma/spec_reason_code"] = reason_codes.get(
+                            spec_reason, -1)
+                    log_dict["sigma/update_step"] = sigma_update_step
 
                 wandb.log(log_dict, step=epoch)
 
