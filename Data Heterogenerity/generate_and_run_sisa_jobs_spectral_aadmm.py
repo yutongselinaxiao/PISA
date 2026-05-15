@@ -22,9 +22,11 @@ Sweep:
 
 Total: 1 × 9 × 3 × 3 = 81 runs.
 
-Wandb project: paper-canonical-fl-spectral-aadmm
-  - Distinct from `paper-canonical-fl` so the new baseline is cleanly
-    separable from the headline comparison.
+Wandb project: paper-canonical-fl-spectral-aadmm-v2
+  - v2 = per-client stacked secants (no α-aggregation). The original
+    `paper-canonical-fl-spectral-aadmm` runs used a buggy aggregation that
+    squashed across-client variance on non-iid FL, causing σ to collapse
+    and the model to diverge. Re-run here with the fix.
 """
 import stat
 import subprocess
@@ -75,7 +77,7 @@ COMMON_ARGS = {
     "l2_lambda": "5e-3",
     "init_seed": "${seed}",
     "use_wandb": "true",
-    "wandb_project": "paper-canonical-fl-spectral-aadmm",
+    "wandb_project": "paper-canonical-fl-spectral-aadmm-v2",
     # Spectral AADMM mode
     "sigma_mode": "spectral_aadmm",
     "sigma_min": "1e-6",  # not consumed by spectral path but argparse expects

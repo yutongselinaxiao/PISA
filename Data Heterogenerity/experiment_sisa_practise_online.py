@@ -331,6 +331,42 @@ def spectral_step(delta_h, delta_lambda, eps=1e-12):
         step = step_sd - 0.5 * step_mg
     return max(step, eps), cor
 
+
+def bb_step_from_moments(gg, dd, dot, eps=1e-12):
+    """BB spectral stepsize from precomputed secant moments.
+
+    Equivalent to `spectral_step(...)` but takes scalars instead of tensor
+    lists. Used by the per-client stacked spectral_aadmm path so we don't
+    need to materialize N×P-sized concatenated tensors just to compute
+    norms and inner products.
+
+    Args:
+        gg:  ‖Δh‖²   (sum of squared norms of "gradient-like" deltas, stacked)
+        dd:  ‖Δλ‖²   (sum of squared norms of "dual" deltas, stacked)
+        dot: ⟨Δh, Δλ⟩  (inner product, stacked)
+
+    Returns:
+        (step, cor) — BB step estimate, cosine correlation in [-1, 1].
+    """
+    gn = math.sqrt(gg + eps)
+    dn = math.sqrt(dd + eps)
+    if gn <= eps or dn <= eps:
+        return 1.0, -1.0
+    cor = dot / max(gn * dn, eps)
+    if dot <= eps:
+        return 1.0, cor
+    if gg <= eps or dd <= eps:
+        return 1.0, cor
+    step_sd = dd / max(dot, eps)
+    step_mg = dot / max(gg, eps)
+    if step_sd <= eps or step_mg <= eps:
+        return 1.0, cor
+    if 2.0 * step_mg > step_sd:
+        step = step_mg
+    else:
+        step = step_sd - 0.5 * step_mg
+    return max(step, eps), cor
+
 def clip_scalar(x, lo, hi):
     return torch.clamp(x, min=lo, max=hi)
 
@@ -1610,13 +1646,19 @@ if __name__ == '__main__':
         sigma_update_step = 0
 
         # ---- State for spectral_aadmm (Xu-Figueiredo-Goldstein 2017) ----
-        # Snapshots of (h, g, lambda_hat, lambda) at the previous spectral
-        # evaluation epoch. All None until the first epoch fires; only
-        # consumed when sigma_mode == 'spectral_aadmm'.
-        spec_h_prev = None
-        spec_g_prev = None
-        spec_lambda_hat_prev = None
-        spec_lambda_prev = None
+        # Per-client stacked secants — the prior α-aggregation `Σ α_i·w_i`
+        # squashes across-client variance that drives the BB estimate on
+        # non-iid FL. We now snapshot the full stacked structure:
+        #   spec_w_prev[i][j]       = w_i^{prev}[j]   (per-client local iterate)
+        #   spec_pi_hat_prev[i][j]  = π_hat_i^{prev}[j]
+        #   spec_pi_final_prev[i][j]= π_final_i^{prev}[j] = π_hat_i − σ·(w_g − w_g_prev_in_round)
+        #   spec_w_g_prev[j]        = w_g^{prev}[j]   (global iterate)
+        # All None until the first eligible epoch; only consumed when
+        # sigma_mode == 'spectral_aadmm'.
+        spec_w_prev = None
+        spec_pi_hat_prev = None
+        spec_pi_final_prev = None
+        spec_w_g_prev_snap = None
         spec_update_period = getattr(args, "spectral_update_period", 2)
         spec_cor_thresh = getattr(args, "spectral_correlation_threshold", 0.2)
         spec_sigma_min = getattr(args, "spectral_sigma_min", 1e-6)
@@ -1779,37 +1821,47 @@ if __name__ == '__main__':
                 for param, w in zip(model.parameters(), W_global):
                     param.copy_(w)
 
-            # ---- Spectral AADMM: snapshot end-of-epoch primal/dual quantities ----
-            # The SISA π-update at line ~1658 produces π_hat = π_old + σ·(w_i − w_g^{k-1})
+            # ---- Spectral AADMM: snapshot end-of-epoch per-client primal/dual ----
+            # The SISA π-update at line ~1658 produces π_hat_i = π_old_i + σ·(w_i − w_g^{k-1})
             # at the per-client level. After W_global aggregation just above,
-            # π_final = π_hat − σ·(w_g^{k} − w_g^{k-1}) (standard ADMM dual recovery).
-            # α-aggregated to the global level (Σ α_i = 1):
-            #   h_curr         = Σ α_i · w_i^{k+1}
-            #   g_curr         = -w_g^{k+1}
-            #   lambda_hat_curr = Σ α_i · π_hat_i
-            #   lambda_curr    = lambda_hat_curr − σ·(w_g^{k+1} − w_g^{k})
-            # Only computed when sigma_mode == 'spectral_aadmm' (cheap to skip).
-            spec_h_curr = None
-            spec_g_curr = None
-            spec_lambda_hat_curr = None
-            spec_lambda_curr = None
+            # π_final_i = π_hat_i − σ·(w_g^{k} − w_g^{k-1}) (standard ADMM dual recovery).
+            #
+            # We keep the FULL stacked structure (per-client, no α-aggregation)
+            # so the BB secant on non-iid FL sees the actual across-client
+            # spread. For consensus ADMM with N clients:
+            #   x_stacked = [w_1, ..., w_N],          A = block-I, Ax = x_stacked
+            #   z         = w_g,                       Bz = -[w_g, ..., w_g] (N copies)
+            #   λ_stacked = [π_1, ..., π_N]
+            #
+            # Only computed when sigma_mode == 'spectral_aadmm' (skip otherwise).
+            spec_w_curr = None
+            spec_pi_hat_curr = None
+            spec_pi_final_curr = None
+            spec_w_g_curr_snap = None
             if sigma_mode == "spectral_aadmm":
                 with torch.no_grad():
-                    # h_curr = sum_i alpha_i * W_b_initial[i][j]   (per-param j)
-                    spec_h_curr = []
-                    spec_lambda_hat_curr = []
-                    for j in range(len(W_global)):
-                        h_j = torch.zeros_like(W_global[j])
-                        lam_hat_j = torch.zeros_like(W_global[j])
-                        for i in range(args.n_parties):
-                            h_j.add_(alpha_b[i] * W_b_initial[i][j].detach())
-                            lam_hat_j.add_(alpha_b[i] * P_b_initial[i][j].detach())
-                        spec_h_curr.append(h_j)
-                        spec_lambda_hat_curr.append(lam_hat_j)
-                    spec_g_curr = [-w.detach().clone() for w in W_global]
-                    spec_lambda_curr = [
-                        lam_hat_j - sigma_lr * (W_global[j] - W_global_prev[j])
-                        for j, lam_hat_j in enumerate(spec_lambda_hat_curr)
+                    # Per-client snapshots (deep copies; one tensor list per client).
+                    spec_w_curr = [
+                        [W_b_initial[i][j].detach().clone()
+                         for j in range(len(W_global))]
+                        for i in range(args.n_parties)
+                    ]
+                    spec_pi_hat_curr = [
+                        [P_b_initial[i][j].detach().clone()
+                         for j in range(len(W_global))]
+                        for i in range(args.n_parties)
+                    ]
+                    spec_w_g_curr_snap = [w.detach().clone() for w in W_global]
+                    # Recover per-client π_final from π_hat using the σ that was
+                    # active during this round's dual update (sigma_lr is the
+                    # round-current value — not yet updated by the spectral
+                    # branch below).
+                    dz = [W_global[j] - W_global_prev[j]
+                          for j in range(len(W_global))]
+                    spec_pi_final_curr = [
+                        [spec_pi_hat_curr[i][j] - sigma_lr * dz[j]
+                         for j in range(len(W_global))]
+                        for i in range(args.n_parties)
                     ]
 
             # compute epoch-level averaged residuals
@@ -2086,25 +2138,66 @@ if __name__ == '__main__':
 
                 elif sigma_mode == "spectral_aadmm":
                     # Xu-Figueiredo-Goldstein 2017 spectral AADMM.
-                    # Update sigma every spectral_update_period eligible epochs,
-                    # using BB-style stepsize from (Δh, Δλ_hat) and (Δg, Δλ),
-                    # gated by a correlation safeguard. Math ported from
-                    # controllers.py:SpectralAADMM (verified inert -- not imported).
+                    # Per-client stacked secant (no α-aggregation): on non-iid FL
+                    # the BB estimate needs the full stacked vector
+                    # [Δw_1,...,Δw_N] vs [Δπ_hat_1,...,Δπ_hat_N], otherwise
+                    # across-client variance — the very thing that drives the
+                    # dual curvature on heterogeneous cells — is squashed.
+                    #
+                    # α channel (primal-side):
+                    #   ‖ΔAx‖² = Σ_i Σ_j ‖Δw_i_j‖²
+                    #   ‖Δλ_hat‖² = Σ_i Σ_j ‖Δπ_hat_i_j‖²
+                    #   ⟨ΔAx, Δλ_hat⟩ = Σ_i Σ_j ⟨Δw_i_j, Δπ_hat_i_j⟩
+                    #
+                    # β channel (z-side):
+                    #   Bz is stacked −w_g (N copies), so:
+                    #   ‖ΔBz‖² = N · Σ_j ‖Δw_g_j‖²
+                    #   ⟨ΔBz, Δλ⟩ = −⟨Δw_g, Σ_i Δπ_final_i⟩
+                    #   ‖Δλ‖² = Σ_i Σ_j ‖Δπ_final_i_j‖²
                     spec_alpha_step = None
                     spec_beta_step = None
                     spec_alpha_cor = None
                     spec_beta_cor = None
                     spec_reason = "wait"
-                    if (spec_h_prev is not None
+                    if (spec_w_prev is not None
                             and (sigma_update_step % spec_update_period == 0)):
-                        d_h = [a - b for a, b in zip(spec_h_curr, spec_h_prev)]
-                        d_g = [a - b for a, b in zip(spec_g_curr, spec_g_prev)]
-                        d_lam_hat = [a - b for a, b in zip(
-                            spec_lambda_hat_curr, spec_lambda_hat_prev)]
-                        d_lam = [a - b for a, b in zip(
-                            spec_lambda_curr, spec_lambda_prev)]
-                        spec_alpha_step, spec_alpha_cor = spectral_step(d_h, d_lam_hat)
-                        spec_beta_step, spec_beta_cor = spectral_step(d_g, d_lam)
+                        N = args.n_parties
+                        P = len(W_global)
+
+                        # α channel: per-client stacked.
+                        gg_a = 0.0  # ||Δw_stacked||²
+                        dd_a = 0.0  # ||Δπ_hat_stacked||²
+                        dot_a = 0.0
+                        for i in range(N):
+                            for j in range(P):
+                                dw = spec_w_curr[i][j] - spec_w_prev[i][j]
+                                dph = spec_pi_hat_curr[i][j] - spec_pi_hat_prev[i][j]
+                                gg_a += float((dw * dw).sum().item())
+                                dd_a += float((dph * dph).sum().item())
+                                dot_a += float((dw * dph).sum().item())
+                        spec_alpha_step, spec_alpha_cor = bb_step_from_moments(
+                            gg_a, dd_a, dot_a)
+
+                        # β channel: g = -w_g repeated N times in stacking.
+                        # Precompute the global iterate delta and the per-param
+                        # summed final-dual delta.
+                        gg_b = 0.0  # ||ΔBz||² = N · ||Δw_g||²
+                        dot_b = 0.0  # ⟨ΔBz, Δλ⟩ = −⟨Δw_g, Σ_i Δπ_final_i⟩
+                        dd_b = 0.0  # ||Δλ_stacked||²
+                        for j in range(P):
+                            dwg = spec_w_g_curr_snap[j] - spec_w_g_prev_snap[j]
+                            wg_norm_sq = float((dwg * dwg).sum().item())
+                            gg_b += N * wg_norm_sq
+                            # Accumulate Σ_i Δπ_final_i_j and Σ_i ‖Δπ_final_i_j‖²
+                            sum_dpf = torch.zeros_like(dwg)
+                            for i in range(N):
+                                dpf = (spec_pi_final_curr[i][j]
+                                       - spec_pi_final_prev[i][j])
+                                sum_dpf.add_(dpf)
+                                dd_b += float((dpf * dpf).sum().item())
+                            dot_b += -float((dwg * sum_dpf).sum().item())
+                        spec_beta_step, spec_beta_cor = bb_step_from_moments(
+                            gg_b, dd_b, dot_b)
 
                         sigma_new = sigma_lr
                         spec_reason = "reject"
@@ -2127,10 +2220,10 @@ if __name__ == '__main__':
 
                     # Rotate snapshots regardless of whether we updated this
                     # round -- prev should always hold the most recent eval.
-                    spec_h_prev = spec_h_curr
-                    spec_g_prev = spec_g_curr
-                    spec_lambda_hat_prev = spec_lambda_hat_curr
-                    spec_lambda_prev = spec_lambda_curr
+                    spec_w_prev = spec_w_curr
+                    spec_pi_hat_prev = spec_pi_hat_curr
+                    spec_pi_final_prev = spec_pi_final_curr
+                    spec_w_g_prev_snap = spec_w_g_curr_snap
 
                 elif sigma_mode == "online_task_aware":
                     cur_train_loss = epoch_train_loss / max(epoch_train_total, 1)
