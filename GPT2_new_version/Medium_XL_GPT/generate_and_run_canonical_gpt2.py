@@ -68,6 +68,9 @@ METHODS = [
     "ogd_lipschitz",             # canonical OGD + BB-Lipschitz hard projection
     "ogd_anchored_canonical",    # anchored OGD with Boyd-canonical residual
     "ogd_anchored_old",          # anchored OGD with OLD non-canonical residual
+    "ogd_anchored_task",         # anchored OGD + loss-increase task term (option 2,
+                                 # 2026-05-15; "back off when loss spikes" signal that's
+                                 # informative even when residuals are uninformative)
 ]
 SEEDS = [1337, 1338, 1339]
 
@@ -77,7 +80,8 @@ def slug(value: str) -> str:
 
 
 def build_command(size: str, method: str, sigma_lr: str, seed: int, nproc: int,
-                  gpus: str | None):
+                  gpus):
+    # gpus: str | None  -- annotation removed for Python 3.8 compatibility.
     info = SIZES[size]
     config_path = info["config_file"].format(method=method)
     tag = f"gpt2_{size}_{method}_sig{slug(sigma_lr)}_seed{seed}"

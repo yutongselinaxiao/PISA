@@ -951,6 +951,127 @@ class SigmaRhoScheduler:
             self.step_num += 1
             return
 
+        # ---- 'ogd_anchored_task' / 'ogd_anchored_task_lipschitz' ----
+        # Anchored OGD + loss-increase task term (option 2 from the
+        # 2026-05-15 design discussion: pick an online loss that has a
+        # meaningful gradient on DDP-homogeneous training). Math ported
+        # from `online_task_aware_update_u` in _online.py, restructured
+        # around the LR-coupled anchor used by `ogd_anchored`:
+        #
+        #     target_u    = base_u + η_k · imbalance                 (anchor + residual signal)
+        #     diff        = u − target_u
+        #     L_t(u)      = diff² + task_lambda · max(0, Δloss) · |diff|
+        #     grad_u      = 2·diff + task_lambda · max(0, Δloss) · sign(diff)
+        #     u_new       = u − η_k · clip(grad_u, ±G)
+        #
+        # Rationale: on DDP-homogeneous training (canonical primal residual is
+        # tiny) the imbalance term ≈ 0 and base_u dominates, so anchored OGD
+        # mostly tracks LR-coupled. The task term ONLY fires when training
+        # loss increased over the last interval — it then pulls σ harder
+        # toward target_u (i.e. toward LR-coupled). This is a "back off when
+        # things are bad" signal that's informative even when residuals
+        # aren't. When loss is decreasing normally, task_loss = 0 and the
+        # update reduces to plain `ogd_anchored`.
+        if self.sigma_method in ('ogd_anchored_task', 'ogd_anchored_task_lipschitz'):
+            # 1. Residual source (canonical RMS or OLD non-canonical).
+            if self.anchored_residual_source == 'old':
+                primal_for_anchor = self.dist_opt.last_primal_res_old
+            else:
+                primal_for_anchor = self.dist_opt.last_primal_res
+            if primal_for_anchor is None:
+                self._set_sigma_rho(sigma_base, rho_base)
+                self.step_num += 1
+                return
+
+            # 2. EMA-smoothed residuals.
+            if self.primal_ema is None:
+                self.primal_ema = float(primal_for_anchor)
+                self.dual_ema = float(dual)
+            else:
+                self.primal_ema = (self.ema_beta * self.primal_ema
+                                   + (1.0 - self.ema_beta) * float(primal_for_anchor))
+                self.dual_ema = (self.ema_beta * self.dual_ema
+                                  + (1.0 - self.ema_beta) * float(dual))
+            primal_smooth = self.primal_ema
+            dual_smooth = self.dual_ema
+
+            imbalance = math.log((primal_smooth + self.eps) / (dual_smooth + self.eps))
+            old_u = self.log_sigma
+            base_u = math.log(max(sigma_base, self.eps))
+
+            # 3. OGD step size schedule (same as ogd_anchored).
+            self.k_sigma += 1
+            if self.ogd_eta_u_decay == 'textbook_sc':
+                eta_k = 1.0 / (2.0 * self.k_sigma)
+            else:
+                eta_k = self.ogd_eta_u / math.sqrt(self.k_sigma + 1.0)
+
+            # 4. Anchored target.
+            target_u = base_u + eta_k * imbalance
+
+            # 5. Residual gradient.
+            diff = old_u - target_u
+            grad_residual = 2.0 * diff
+
+            # 6. Task gradient (only fires on loss increase between steps).
+            loss_increase = 0.0
+            if train_loss is not None:
+                cur_loss = float(train_loss)
+                if (self.prev_train_loss is not None
+                        and math.isfinite(cur_loss)
+                        and math.isfinite(self.prev_train_loss)):
+                    loss_increase = max(0.0, cur_loss - self.prev_train_loss)
+                if math.isfinite(cur_loss):
+                    self.prev_train_loss = cur_loss
+            if diff > 0:
+                grad_task = loss_increase
+            elif diff < 0:
+                grad_task = -loss_increase
+            else:
+                grad_task = 0.0
+
+            # 7. Combined gradient + clip.
+            grad_u = grad_residual + self.task_lambda * grad_task
+            grad_u = max(-self.ogd_G_clip, min(self.ogd_G_clip, grad_u))
+            u_raw = old_u - eta_k * grad_u
+
+            # 8. Trust region (same as ogd_anchored).
+            max_delta_k = max(self.max_delta_min,
+                              self.max_delta / math.sqrt(self.k_sigma + 1.0))
+            u_raw = min(max(u_raw, old_u - max_delta_k), old_u + max_delta_k)
+
+            # 9. Damped blend.
+            blend_k = max(self.blend_min,
+                           self.blend / math.sqrt(self.k_sigma + 1.0))
+            u_new = (1.0 - blend_k) * old_u + blend_k * u_raw
+
+            # 10. Lipschitz floor (hard projection) for +lipschitz variant.
+            self.last_floor_active = False
+            if (self.sigma_method == 'ogd_anchored_task_lipschitz'
+                    and self.L_hat_ema > 0.0):
+                log_floor = (math.log(max(self.L_hat_ema, self.eps))
+                             + math.log(max(self.lipschitz_floor_alpha, self.eps)))
+                if u_new < log_floor:
+                    u_new = log_floor
+                    self.last_floor_active = True
+
+            # 11. Global projection.
+            u_new = min(max(u_new, math.log(self.sigma_min_canonical)),
+                        math.log(self.sigma_max_canonical))
+            self.log_sigma = u_new
+
+            # 12. Diagnostics.
+            self.ta_res_loss = diff ** 2
+            self.ta_task_loss = loss_increase * abs(diff)
+            self.ta_total_loss = self.ta_res_loss + self.task_lambda * self.ta_task_loss
+            self.ta_loss_increase = loss_increase
+
+            sigma_t = math.exp(u_new)
+            rho_t = self.rho_over_sigma * sigma_t
+            self._set_sigma_rho(sigma_t, rho_t)
+            self.step_num += 1
+            return
+
         # ---- 'task_aware' (legacy): anchored task-aware mode. ----
         # Kept for backward compat with `train_gpt2_medium_task_aware.py` only.
         # The anchored convex_bal mode that used to live here was REMOVED on
@@ -1272,7 +1393,7 @@ class Hyperparameters:
     task_lambda: float = 1.0       # weight of task-awareness term
 
     # ---- Canonical sigma rule (matches _online.py) ----
-    sigma_method: str = 'ogd'      # 'original' | 'ogd' | 'ogd_lipschitz' | 'ogd_anchored' | 'ogd_anchored_lipschitz' | 'task_aware'
+    sigma_method: str = 'ogd'      # 'original' | 'ogd' | 'ogd_lipschitz' | 'ogd_anchored' | 'ogd_anchored_lipschitz' | 'ogd_anchored_task' | 'ogd_anchored_task_lipschitz' | 'task_aware'
     anchored_residual_source: str = 'canonical'   # for ogd_anchored*: 'canonical' or 'old'
     ogd_eta_u: float = 0.05
     ogd_eta_u_decay: str = 'textbook_sc'
