@@ -241,6 +241,20 @@ def get_args():
                         help='hard projection floor: sigma >= alpha * L_hat. '
                              'alpha=1 reproduces the canonical hard projection.')
 
+    # Polyak-style EMA on the local iterate w during local training. Returned
+    # to the global aggregation in place of the raw post-training w. Designed
+    # to smooth out per-batch class bias on extreme non-iid splits (label1
+    # cells), where each batch sees a single class and the raw w bounces
+    # widely between class-specific local minima. β = 0 (default) disables;
+    # β ∈ (0, 1) maintains w_ema ← β·w_ema + (1−β)·w after each batch step
+    # (post optimizer.step and post-explicit-shrinkage), and returns w_ema as
+    # the client's local iterate for the round.
+    parser.add_argument('--local_weight_ema_beta', type=float, default=0.0,
+                        help='Polyak EMA on local iterate w during local training. '
+                             '0 = disabled (default); 0.99 = aggressive smoothing. '
+                             'Affects only local_admm_train; the σ-rule and '
+                             'global aggregation are unchanged.')
+
     parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
     parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
@@ -1137,6 +1151,15 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         (params, avg_loss) for sgd/adam/amsgrad/adamw_admm_explicit
         (params, avg_loss, optimizer_state_dict) for adam_warmstart and
         adamw_admm_explicit_warmstart
+
+    LOCAL POLYAK EMA (2026-05-18): if `args.local_weight_ema_beta > 0`, the
+    returned `params` is a per-param EMA `w_ema ← β·w_ema + (1−β)·w` updated
+    AFTER each batch's optimizer.step() (and the explicit-shrinkage step for
+    AdamW-explicit). Smooths out per-batch class bias on label1 cells where
+    each batch sees a single class; the σ-rule and global aggregation see
+    the smoothed iterate without modification. β=0 (default) preserves the
+    original behavior exactly. Applies to all optimizers; tested primarily
+    with adamw_admm_explicit{_warmstart}.
     """
     # ----- Initialization: reset (default) or warm-start (opt-in) -----
     local_init = getattr(args, "local_init", "reset")
@@ -1191,6 +1214,19 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     # sigma-invariant, which is what fixes the prior collapse pathology.
     adamw_eta_r = args.lr / max(sigma_lr, 1.0) if is_adamw_decoupled else 0.0
 
+    # Polyak-style EMA on w during local training. β=0 disables; the buffer
+    # is initialized to the starting parameters (post reset/warm init) and
+    # updated AFTER each batch's optimizer + explicit-shrinkage step. The
+    # ema is what's returned to the global aggregation, so the σ-rule sees
+    # a smoother per-client iterate. Designed for label1 where per-batch
+    # gradients are dominated by a single class.
+    local_w_ema_beta = float(getattr(args, "local_weight_ema_beta", 0.0))
+    use_local_w_ema = 0.0 < local_w_ema_beta < 1.0
+    w_ema = None
+    if use_local_w_ema:
+        with torch.no_grad():
+            w_ema = [p.detach().clone() for p in model.parameters()]
+
     for _ in range(args.epochs):
         for x, target in train_dl_local:
             x, target = x.to(device), target.to(device).long()
@@ -1224,6 +1260,15 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
                     for p, wg, pi in zip(model.parameters(), w_global, pi_local):
                         p.sub_(adamw_eta_r * alpha_i * (pi + sigma_lr * (p - wg)))
 
+            # Polyak EMA on w after optimizer.step + explicit shrinkage:
+            #   w_ema <- β·w_ema + (1−β)·w
+            if use_local_w_ema:
+                with torch.no_grad():
+                    for buf, p in zip(w_ema, model.parameters()):
+                        buf.mul_(local_w_ema_beta).add_(
+                            (1.0 - local_w_ema_beta) * p.detach()
+                        )
+
             # Logging always reflects the full augmented-Lagrangian loss
             # so train_local_admm_loss_avg is comparable across optimizers.
             full_loss = alpha_i * (task_loss + dual_term + quad_term)
@@ -1231,7 +1276,13 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
-    params = [p.detach().clone() for p in model.parameters()]
+    if use_local_w_ema:
+        # Return the smoothed local iterate. The global aggregation and the
+        # σ-rule see this; per-batch class bias is averaged out before it
+        # hits the residuals.
+        params = [buf.detach().clone() for buf in w_ema]
+    else:
+        params = [p.detach().clone() for p in model.parameters()]
 
     if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit_warmstart'):
         return params, avg_loss, optimizer.state_dict()
