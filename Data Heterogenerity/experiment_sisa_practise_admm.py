@@ -255,6 +255,28 @@ def get_args():
                              'Affects only local_admm_train; the σ-rule and '
                              'global aggregation are unchanged.')
 
+    # σ-coupled-but-bounded consensus step for adamw_admm_explicit{_warmstart}.
+    # When cap = 0 (default), uses the σ-invariant rate eta_r = lr/σ — the
+    # 2026-05-02 fix that prevented collapse at large σ but also unhooks σ
+    # from consensus strength entirely. When cap > 0, uses
+    #     eta_r = min(lr, cap / (alpha_i * sigma))
+    # so the per-batch (w − w_g) coefficient becomes
+    #     eta_r * alpha_i * sigma = min(lr * alpha_i * sigma, cap)
+    # i.e. it scales linearly with σ until it saturates at `cap`. At σ above
+    # the crossover, the cap (cap / batch) is the effective per-batch
+    # consensus pull — strong enough to enforce real consensus over a local
+    # round (~30 batches), but bounded away from the prior 100%/batch
+    # collapse pathology. The π coefficient becomes eta_r * alpha_i =
+    # min(lr*alpha, cap/sigma), so π's contribution is also damped at large σ
+    # in the same way the σ-invariant fix used to do for the entire step.
+    # Intended for label1 cells where AdamW-explicit's σ-decoupled shrinkage
+    # currently fails. cap = 0.1 (10%/batch) is a reasonable starting value.
+    parser.add_argument('--adamw_consensus_cap', type=float, default=0.0,
+                        help='Bound on per-batch consensus rate for '
+                             'adamw_admm_explicit{_warmstart}. 0 = disabled '
+                             '(keep σ-invariant lr/σ scheme); 0.1 = cap at '
+                             '10%%/batch. See docstring of local_admm_train.')
+
     parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
     parser.add_argument('--wandb_group', type=str, default='default-group', help='wandb group name')
@@ -1160,6 +1182,18 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     the smoothed iterate without modification. β=0 (default) preserves the
     original behavior exactly. Applies to all optimizers; tested primarily
     with adamw_admm_explicit{_warmstart}.
+
+    σ-COUPLED BOUNDED SHRINKAGE (2026-05-18): if `args.adamw_consensus_cap > 0`,
+    the AdamW-explicit per-batch reg step switches from the σ-invariant rate
+    eta_r = lr / σ to a σ-coupled-but-bounded rate
+        eta_r = min(lr, cap / (alpha_i · σ))
+    so the per-batch (w − w_g) coefficient becomes
+        eta_r · alpha_i · σ  =  min(lr · alpha_i · σ, cap)
+    — linear in σ up to the crossover σ* = cap / (lr · alpha_i), then capped
+    at `cap` per batch above. Re-establishes σ as a real consensus knob in
+    AdamW-explicit, which the σ-invariant fix had removed. Intended for
+    label1 cells where σ-invariant shrinkage cannot enforce strong enough
+    consensus. cap = 0 (default) preserves the σ-invariant formula exactly.
     """
     # ----- Initialization: reset (default) or warm-start (opt-in) -----
     local_init = getattr(args, "local_init", "reset")
@@ -1209,10 +1243,34 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     epoch_loss = 0.0
     n_batches = 0
 
-    # AdamW-decoupled reg-step coefficient: eta_r = args.lr / max(sigma, 1).
-    # Per-batch shrinkage rate eta_r * alpha * sigma = args.lr * alpha is
-    # sigma-invariant, which is what fixes the prior collapse pathology.
-    adamw_eta_r = args.lr / max(sigma_lr, 1.0) if is_adamw_decoupled else 0.0
+    # AdamW-decoupled reg-step coefficient.
+    #
+    # Default (consensus_cap = 0): eta_r = args.lr / max(sigma, 1) gives a
+    # sigma-invariant per-batch shrinkage rate eta_r * alpha * sigma =
+    # args.lr * alpha (~1e-4). This was the 2026-05-02 fix for the prior
+    # collapse pathology at large sigma — but it also unhooks sigma from the
+    # consensus pull entirely, which is what fails on label1 cells.
+    #
+    # Option 1 (consensus_cap > 0): eta_r = min(lr, cap / (alpha * sigma)).
+    # Per-batch consensus rate on (w − w_g) becomes
+    #     eta_r * alpha * sigma = min(lr * alpha * sigma, cap)
+    # i.e. it scales linearly with sigma until it saturates at `cap`. Above
+    # the crossover sigma* = cap / (lr * alpha), the cap binds and the
+    # per-batch consensus rate is exactly `cap` regardless of how large sigma
+    # grows — strong (~cap per batch, cumulative ~95% over ~30 batches at
+    # cap=0.1) but bounded away from runaway collapse.
+    consensus_cap = float(getattr(args, "adamw_consensus_cap", 0.0))
+    if is_adamw_decoupled:
+        sigma_safe = max(sigma_lr, 1.0)
+        if consensus_cap > 0.0:
+            adamw_eta_r = min(
+                args.lr,
+                consensus_cap / (max(alpha_i, 1e-12) * sigma_safe),
+            )
+        else:
+            adamw_eta_r = args.lr / sigma_safe
+    else:
+        adamw_eta_r = 0.0
 
     # Polyak-style EMA on w during local training. β=0 disables; the buffer
     # is initialized to the starting parameters (post reset/warm init) and
