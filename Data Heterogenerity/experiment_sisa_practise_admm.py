@@ -241,19 +241,21 @@ def get_args():
                         help='hard projection floor: sigma >= alpha * L_hat. '
                              'alpha=1 reproduces the canonical hard projection.')
 
-    # Polyak-style EMA on the local iterate w during local training. Returned
-    # to the global aggregation in place of the raw post-training w. Designed
-    # to smooth out per-batch class bias on extreme non-iid splits (label1
-    # cells), where each batch sees a single class and the raw w bounces
-    # widely between class-specific local minima. β = 0 (default) disables;
-    # β ∈ (0, 1) maintains w_ema ← β·w_ema + (1−β)·w after each batch step
-    # (post optimizer.step and post-explicit-shrinkage), and returns w_ema as
-    # the client's local iterate for the round.
-    parser.add_argument('--local_weight_ema_beta', type=float, default=0.0,
-                        help='Polyak EMA on local iterate w during local training. '
-                             '0 = disabled (default); 0.99 = aggressive smoothing. '
-                             'Affects only local_admm_train; the σ-rule and '
-                             'global aggregation are unchanged.')
+    # NOTE (2026-05-18, REMOVED): --local_weight_ema_beta added an
+    # intra-round Polyak EMA on each client's iterate w (`w_ema ← β·w_ema +
+    # (1−β)·w` per batch, returned to the global aggregation). The intuition
+    # was to smooth per-batch class bias on label1 cells. The empirical
+    # result was the opposite: within-client averaging cannot reduce
+    # between-client bias (each client's gradient is class-biased
+    # consistently throughout the round, so there's no temporal variance to
+    # average), and at β=0.99 with ~30 batches/round the returned iterate
+    # is heavily damped toward w_init=w_g, cutting effective learning rate
+    # ~4×. EMA-w pilot on paper-adamw-explicit-lip-wema-pilot lost 10-30pp
+    # vs no-EMA on every label1 cell. The right axis is BETWEEN-client and
+    # ACROSS-rounds, which is what --global_weight_ema_beta below provides
+    # (FedAvgM-style server-side EMA). Removed cleanly; the wema pilot
+    # launcher generates scripts that pass --local_weight_ema_beta=0.99 and
+    # will need to be updated or those runs killed.
 
     # σ-coupled-but-bounded consensus step for adamw_admm_explicit{_warmstart}.
     # When cap = 0 (default), uses the σ-invariant rate eta_r = lr/σ — the
@@ -276,6 +278,28 @@ def get_args():
                              'adamw_admm_explicit{_warmstart}. 0 = disabled '
                              '(keep σ-invariant lr/σ scheme); 0.1 = cap at '
                              '10%%/batch. See docstring of local_admm_train.')
+
+    # Server-side (FedAvgM-style) Polyak EMA on W_global. After each round's
+    # aggregation, maintain W_global_ema ← β_g·W_global_ema + (1−β_g)·W_global
+    # and substitute W_global := W_global_ema for ALL downstream uses
+    # (next-round broadcast as the local anchor, dual update, BB Lipschitz
+    # snapshot, model state for test eval). This smooths the inherently
+    # noisy aggregate on extreme non-iid splits — clients pull in different
+    # class-biased directions each round, so the raw aggregate swings; an
+    # EMA over rounds gives a stable target both for the local solve and
+    # for the σ-rule. β_g = 0 (default) disables; β_g ∈ (0, 1) enables.
+    # Theory-friendly: the local subproblem still has its argmin structure
+    # intact; only the value of the anchor evolves more slowly between
+    # rounds. Replaces the (removed) intra-round --local_weight_ema_beta,
+    # which acted on the wrong axis (within-client temporal, where label1
+    # has no variance to average).
+    parser.add_argument('--global_weight_ema_beta', type=float, default=0.0,
+                        help='FedAvgM-style server-side EMA on W_global. '
+                             '0 = disabled (default); 0.9 / 0.99 = moderate / '
+                             'aggressive smoothing of the global aggregate '
+                             'across rounds. Substitutes W_global with its '
+                             'EMA for next-round local broadcast, dual '
+                             'update, and test eval.')
 
     parser.add_argument('--use_wandb', type=bool, default=False, help='whether to use wandb')
     parser.add_argument('--wandb_project', type=str, default='sisa-adaptive-sigma', help='wandb project name')
@@ -1174,14 +1198,18 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
         (params, avg_loss, optimizer_state_dict) for adam_warmstart and
         adamw_admm_explicit_warmstart
 
-    LOCAL POLYAK EMA (2026-05-18): if `args.local_weight_ema_beta > 0`, the
-    returned `params` is a per-param EMA `w_ema ← β·w_ema + (1−β)·w` updated
-    AFTER each batch's optimizer.step() (and the explicit-shrinkage step for
-    AdamW-explicit). Smooths out per-batch class bias on label1 cells where
-    each batch sees a single class; the σ-rule and global aggregation see
-    the smoothed iterate without modification. β=0 (default) preserves the
-    original behavior exactly. Applies to all optimizers; tested primarily
-    with adamw_admm_explicit{_warmstart}.
+    REMOVED LOCAL POLYAK EMA (2026-05-18 → 2026-05-18): An intra-round
+    Polyak EMA on each client's iterate (`--local_weight_ema_beta`) was
+    added and then removed the same day. Pilot on
+    `paper-adamw-explicit-lip-wema-pilot` showed it lost 10-30pp vs no-EMA
+    on every label1 cell. Diagnosis: within-client averaging cannot
+    reduce BETWEEN-client bias (each client's gradient is class-biased
+    consistently throughout the round, so there's no temporal variance
+    to average); and at β=0.99 with ~30 batches/round the returned
+    iterate is dominated by `w_init=w_g`, cutting effective learning
+    rate ~4×. The correct axis for EMA is server-side, across rounds —
+    see `--global_weight_ema_beta` (FedAvgM-style, maintained in the main
+    ADMM loop, NOT in local_admm_train).
 
     σ-COUPLED BOUNDED SHRINKAGE (2026-05-18): if `args.adamw_consensus_cap > 0`,
     the AdamW-explicit per-batch reg step switches from the σ-invariant rate
@@ -1272,19 +1300,6 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
     else:
         adamw_eta_r = 0.0
 
-    # Polyak-style EMA on w during local training. β=0 disables; the buffer
-    # is initialized to the starting parameters (post reset/warm init) and
-    # updated AFTER each batch's optimizer + explicit-shrinkage step. The
-    # ema is what's returned to the global aggregation, so the σ-rule sees
-    # a smoother per-client iterate. Designed for label1 where per-batch
-    # gradients are dominated by a single class.
-    local_w_ema_beta = float(getattr(args, "local_weight_ema_beta", 0.0))
-    use_local_w_ema = 0.0 < local_w_ema_beta < 1.0
-    w_ema = None
-    if use_local_w_ema:
-        with torch.no_grad():
-            w_ema = [p.detach().clone() for p in model.parameters()]
-
     for _ in range(args.epochs):
         for x, target in train_dl_local:
             x, target = x.to(device), target.to(device).long()
@@ -1318,15 +1333,6 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
                     for p, wg, pi in zip(model.parameters(), w_global, pi_local):
                         p.sub_(adamw_eta_r * alpha_i * (pi + sigma_lr * (p - wg)))
 
-            # Polyak EMA on w after optimizer.step + explicit shrinkage:
-            #   w_ema <- β·w_ema + (1−β)·w
-            if use_local_w_ema:
-                with torch.no_grad():
-                    for buf, p in zip(w_ema, model.parameters()):
-                        buf.mul_(local_w_ema_beta).add_(
-                            (1.0 - local_w_ema_beta) * p.detach()
-                        )
-
             # Logging always reflects the full augmented-Lagrangian loss
             # so train_local_admm_loss_avg is comparable across optimizers.
             full_loss = alpha_i * (task_loss + dual_term + quad_term)
@@ -1334,13 +1340,7 @@ def local_admm_train(model, train_dl_local, w_global, pi_local, sigma_lr, args, 
             n_batches += 1
 
     avg_loss = epoch_loss / max(n_batches, 1)
-    if use_local_w_ema:
-        # Return the smoothed local iterate. The global aggregation and the
-        # σ-rule see this; per-batch class bias is averaged out before it
-        # hits the residuals.
-        params = [buf.detach().clone() for buf in w_ema]
-    else:
-        params = [p.detach().clone() for p in model.parameters()]
+    params = [p.detach().clone() for p in model.parameters()]
 
     if args.optimizer in ('adam_warmstart', 'adamw_admm_explicit_warmstart'):
         return params, avg_loss, optimizer.state_dict()
@@ -1787,6 +1787,19 @@ if __name__ == '__main__':
             args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda
         )
 
+        # Server-side (FedAvgM-style) EMA on W_global. β_g = 0 disables; if
+        # > 0, after each aggregation we maintain W_global_ema and
+        # SUBSTITUTE W_global := W_global_ema so all downstream consumers
+        # (next-round local broadcast, dual update, BB Lipschitz snapshot,
+        # model state for test eval) see the smoothed aggregate. The buffer
+        # is initialized to the round-0 aggregate, so the first round is
+        # identical to the non-EMA case.
+        global_w_ema_beta = float(getattr(args, "global_weight_ema_beta", 0.0))
+        use_global_w_ema = 0.0 < global_w_ema_beta < 1.0
+        W_global_ema = (
+            [w.detach().clone() for w in W_global] if use_global_w_ema else None
+        )
+
         with torch.no_grad():
             for param, w in zip(model.parameters(), W_global):
                 param.copy_(w)
@@ -1914,6 +1927,21 @@ if __name__ == '__main__':
                 alpha_b,
                 l2_lambda
             )
+
+            # Server-side EMA: W_global_ema ← β_g·W_global_ema + (1−β_g)·W_global,
+            # then substitute W_global := W_global_ema so everything
+            # downstream (model copy for test eval, dual update, next-round
+            # local solve anchor, next-round BB Lipschitz snapshot) sees the
+            # smoothed aggregate. The raw W_global from this aggregation is
+            # only used to feed the EMA — clients never broadcast against
+            # the raw aggregate after round 0.
+            if use_global_w_ema:
+                with torch.no_grad():
+                    for buf, w_new in zip(W_global_ema, W_global):
+                        buf.mul_(global_w_ema_beta).add_(
+                            (1.0 - global_w_ema_beta) * w_new.detach()
+                        )
+                W_global = [buf.detach().clone() for buf in W_global_ema]
 
             with torch.no_grad():
                 for param, w in zip(model.parameters(), W_global):

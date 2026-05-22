@@ -1,26 +1,42 @@
-"""Polyak local-iterate EMA pilot for AdamW-explicit + Lipschitz floor.
+"""FedAvgM-style server-side EMA pilot for AdamW-explicit + Lipschitz floor.
 
-Tests whether smoothing the local iterate w (EMA across batches within a
-local round) closes the label1 gap for AdamW-explicit+lip. Hypothesis:
-each batch on label1 sees a single class, so the raw post-training w is
-biased toward that class; averaging across batches before global
-aggregation reduces this bias.
+REPURPOSED 2026-05-18: the original within-client EMA pilot (this file's
+prior contents, --local_weight_ema_beta) was killed after a negative
+result — within-client averaging cannot reduce between-client bias on
+label1. The file is reused for the right-axis fix: server-side EMA on
+W_global (--global_weight_ema_beta), which smooths the aggregate ACROSS
+rounds rather than within a client's local batches.
 
-Method change: `--local_weight_ema_beta=0.99` is added to the existing
-adamw_admm_explicit{_warmstart} + Lipschitz floor command lines. β=0
-(default) preserves the prior behavior exactly; β=0.99 maintains a
-Polyak-style EMA on w throughout local training and returns the EMA to
-the global aggregation.
+Hypothesis: on extreme non-iid (label1), the per-round aggregate W_global
+swings between rounds because clients pull in different class-biased
+directions. Smoothing W_global with an EMA across rounds gives a stable
+consensus target for both the local solve and the σ-rule, which should
+close the label1 gap for AdamW-explicit-warmstart without the per-batch
+damping pathology of within-client EMA.
 
-Scope: the same 2 specs × 9 cells × 3 σ × 3 seeds = 162 runs the box plot
-needs for the AdamW+lip comparison. Wandb project is SEPARATE
-(`paper-adamw-explicit-lip-wema-pilot`) so the EMA results are cleanly
-comparable to the existing `exact-admm-local-solver-adam` runs without
-the EMA.
+Method: `--global_weight_ema_beta=0.9` (FedAvgM default) added to the
+adamw_admm_explicit_warmstart + Lipschitz floor command lines. β_g = 0
+(default in the experiment script) preserves the prior behavior exactly;
+β_g > 0 maintains W_global_ema = β_g·W_global_ema + (1−β_g)·W_global and
+SUBSTITUTES W_global := W_global_ema for ALL downstream uses (next-round
+local broadcast, dual update, BB Lipschitz snapshot, model state for
+test eval).
 
-Resumable: queries wandb for finished/running runs in the pilot project
-and only emits scripts for the missing cells, so the launcher can be
-re-run after interruptions.
+Scope: 1 spec × 9 cells × 3 σ × 3 seeds = 81 runs. Warmstart-only —
+matches the σ-coupled-cap pilot's scope and tests the same hypothesis
+on the strongest baseline.
+
+Loop order: outer = seed, then case (label1 first, then label2, then
+label3), then σ_lr. With 12 parallel workers the first batch of seed=0
+saturates GPUs with the 3 label1 cells × 3 σ_0, so the critical-question
+results land first.
+
+Wandb project: `paper-adamw-explicit-lip-gema-pilot` (separate from the
+defunct `paper-adamw-explicit-lip-wema-pilot` so the global-EMA results
+are cleanly distinguishable from the dead within-client-EMA pilot).
+
+Resumable: queries wandb for finished/running runs in the new pilot
+project and only emits scripts for missing cells.
 
 ep=3 only (matches box-plot canonical comparison).
 """
@@ -33,31 +49,35 @@ from pathlib import Path
 import wandb
 
 ENTITY = "selinayutongxiao-university-of-southern-californ"
-PROJECT = "paper-adamw-explicit-lip-wema-pilot"
+PROJECT = "paper-adamw-explicit-lip-gema-pilot"
 
-OUTPUT_DIR = Path("generated_adamw_lipschitz_wema")
+OUTPUT_DIR = Path("generated_adamw_lipschitz_gema")
 LOG_DIR = OUTPUT_DIR / "logs"
 
 CUDA_DEVICES = ["0", "1", "2", "3"]
-MAX_PARALLEL_PER_GPU = 3  # adam ep=3 is moderately heavy
+MAX_PARALLEL_PER_GPU = 3
 
 SEEDS = [0, 1, 2]
 SIGMA_LR_VALUES = ["1e2", "1e3", "1e4"]
 EPOCH_VALUES = ["3"]
 
-LOCAL_WEIGHT_EMA_BETA = "0.99"  # the knob this pilot is testing
+# The knob this pilot is testing. FedAvgM-style server-side EMA on
+# W_global. β_g = 0.9 = moderate smoothing (effective window ~10 rounds);
+# 0.99 = aggressive (~100 rounds, lags more behind training).
+GLOBAL_WEIGHT_EMA_BETA = "0.9"
 
 ENTRY = "experiment_sisa_practise_admm.py"
 
+# Ordered so all label1 cells come first, then label2, then label3.
 CASES = [
     {"case_name": "mnist_label1_n10",   "dataset": "mnist",   "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "mnist_label2_n10",   "dataset": "mnist",   "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "mnist_label3_n10",   "dataset": "mnist",   "partition": "noniid-#label3", "model": "simple-cnn"},
     {"case_name": "fmnist_label1_n10",  "dataset": "fmnist",  "partition": "noniid-#label1", "model": "simple-cnn"},
-    {"case_name": "fmnist_label2_n10",  "dataset": "fmnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
-    {"case_name": "fmnist_label3_n10",  "dataset": "fmnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
     {"case_name": "cifar10_label1_n10", "dataset": "cifar10", "partition": "noniid-#label1", "model": "simple-cnn"},
+    {"case_name": "mnist_label2_n10",   "dataset": "mnist",   "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "fmnist_label2_n10",  "dataset": "fmnist",  "partition": "noniid-#label2", "model": "simple-cnn"},
     {"case_name": "cifar10_label2_n10", "dataset": "cifar10", "partition": "noniid-#label2", "model": "simple-cnn"},
+    {"case_name": "mnist_label3_n10",   "dataset": "mnist",   "partition": "noniid-#label3", "model": "simple-cnn"},
+    {"case_name": "fmnist_label3_n10",  "dataset": "fmnist",  "partition": "noniid-#label3", "model": "simple-cnn"},
     {"case_name": "cifar10_label3_n10", "dataset": "cifar10", "partition": "noniid-#label3", "model": "simple-cnn"},
 ]
 
@@ -87,7 +107,7 @@ COMMON_ARGS = {
     "eta_u_decay": "textbook_sc",
     "G_clip": "5.0",
     "sigma_update_freq": "1",
-    "local_weight_ema_beta": LOCAL_WEIGHT_EMA_BETA,
+    "global_weight_ema_beta": GLOBAL_WEIGHT_EMA_BETA,
 }
 
 OGD_LIPSCHITZ_ARGS = {
@@ -100,12 +120,11 @@ OGD_LIPSCHITZ_ARGS = {
     "lipschitz_floor_alpha": "1.0",
 }
 
-# Only the +Lipschitz variants are in scope for this pilot (the EMA fix
-# targets the failure mode of AdamW-explicit+lip on label1). The no-floor
-# variants don't have the failure to fix.
+# Just adamw_admm_explicit_warmstart — the strongest baseline. Label1 gap
+# vs ogd_sisa+lip is widest here, so if server-side EMA closes that gap,
+# the hypothesis is confirmed in one pilot.
 SOLVERS = [
-    ("adamw_admm_explicit_warmstart",   "adamw_ws_wema"),
-    ("adamw_admm_explicit",             "adamw_cold_wema"),
+    ("adamw_admm_explicit_warmstart", "adamw_ws_gema"),
 ]
 
 JOB_SPECS = []
@@ -135,16 +154,10 @@ def make_executable(path):
 
 
 def expected_run_name(case, tag, seed):
-    """Mirrors the wandb_run_name format `{dataset}_{tag}_seed{seed}`."""
     return f"{case['dataset']}_{tag}_seed{seed}"
 
 
 def fetch_existing_runs(skip_running=True):
-    """Returns set of run names already finished (or currently running) in
-    the pilot project, so the resumable launcher skips them.
-
-    If the project doesn't exist yet (first launch) returns an empty set.
-    """
     api = wandb.Api(timeout=60)
     try:
         runs = list(api.runs(f"{ENTITY}/{PROJECT}", per_page=500))
@@ -199,10 +212,12 @@ def main():
     print(f"Querying wandb project '{PROJECT}' for already-finished/running runs ...")
     skip_set = fetch_existing_runs(skip_running=True)
 
+    # seed = outer loop, case = next (label1 first thanks to CASES ordering),
+    # then spec, then sigma_lr.
     all_jobs = []
     for seed in SEEDS:
-        for spec in JOB_SPECS:
-            for case in CASES:
+        for case in CASES:
+            for spec in JOB_SPECS:
                 for slr in SIGMA_LR_VALUES:
                     tag = spec["tag"](slr)
                     name = f"{case['case_name']}_{tag}_seed{seed}.sh"
@@ -233,7 +248,7 @@ def main():
         generated.append((path, gpu, spec["spec_id"]))
 
     total = len(generated)
-    print(f"\nGenerated {total} missing scripts.")
+    print(f"\nGenerated {total} missing scripts (label1 cells of seed 0 first).")
 
     if not RUN_AFTER_GENERATION:
         return
