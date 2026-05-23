@@ -1787,21 +1787,61 @@ if __name__ == '__main__':
             args.n_parties, W_b_initial, P_b_initial, sigma_lr, alpha_b, l2_lambda
         )
 
-        # Server-side (FedAvgM-style) EMA on W_global. β_g = 0 disables; if
-        # > 0, after each aggregation we maintain W_global_ema and
-        # SUBSTITUTE W_global := W_global_ema so all downstream consumers
-        # (next-round local broadcast, dual update, BB Lipschitz snapshot,
-        # model state for test eval) see the smoothed aggregate. The buffer
-        # is initialized to the round-0 aggregate, so the first round is
-        # identical to the non-EMA case.
+        # Server-side (FedAvgM-style) EMA on W_global, hybrid mode (2026-05-23).
+        #
+        # When β_g = 0 (default): no EMA — W_global is the raw aggregate and is
+        # used everywhere, exactly as in the no-EMA baseline.
+        #
+        # When β_g > 0: we DO NOT substitute W_global := W_global_ema. Instead
+        # we keep two parallel quantities:
+        #   - W_global          : the RAW aggregate from generate_W_global.
+        #                         Consumed only by the σ-rule's residual
+        #                         computation (primal and dual) so OGD on log σ
+        #                         sees an undistorted signal — the dual is NOT
+        #                         shrunk by (1−β_g) the way it was under the
+        #                         prior full-substitution gEMA.
+        #   - W_global_anchor   : the SMOOTHED aggregate (= W_global_ema when
+        #                         EMA is on, otherwise = W_global). Consumed by
+        #                         the algorithm's actual working state:
+        #                         next-round local broadcast, dual update, BB
+        #                         Lipschitz snapshot, and model state for test
+        #                         eval. Clients pull toward this stable target.
+        #
+        # Trade-off acknowledged: the algorithm's actual y-iterate is
+        # W_global_anchor (= W_global_ema), which is a convex combination of
+        # the previous iterate and the exact y-argmin — NOT an exact y-argmin.
+        # So Lemma 5 of the OGD-on-σ theorem (exact y-subproblem solve) still
+        # fails in this hybrid. The fix here is purely empirical: it gives the
+        # σ-rule a clean residual signal so σ_0-robustness is recovered, while
+        # preserving the smoothed-target intuition for clients. For
+        # theorem-clean behavior, set β_g = 0 (no EMA in training dynamics);
+        # any EMA accuracy gain should then come from an eval-only buffer.
+        #
+        # CHANGE HISTORY:
+        # - 2026-05-18 (introduced): added --global_weight_ema_beta with full
+        #   substitution W_global := W_global_ema everywhere downstream. Pilot
+        #   on paper-adamw-explicit-lip-gema-pilot showed σ_0-spread blew up
+        #   to 20-30pp on label2/3 cells (vs ~2pp baseline). Diagnosis: the
+        #   substitution shrunk the σ-rule's dual residual by (1−β_g),
+        #   inflating primal/dual and biasing OGD upward indefinitely.
+        # - 2026-05-23 (this change): switched to hybrid — W_global stays
+        #   raw, W_global_anchor (= EMA) is used by the algorithm. σ-rule
+        #   sees raw residuals. Eliminates the σ-bias while keeping the
+        #   smoothed anchor for clients.
         global_w_ema_beta = float(getattr(args, "global_weight_ema_beta", 0.0))
         use_global_w_ema = 0.0 < global_w_ema_beta < 1.0
         W_global_ema = (
             [w.detach().clone() for w in W_global] if use_global_w_ema else None
         )
+        # Anchor used by the algorithm (local solve / dual / model state / BB).
+        # At round 0 it equals W_global; once gEMA is active it diverges.
+        W_global_anchor = (
+            [w.detach().clone() for w in W_global_ema]
+            if use_global_w_ema else W_global
+        )
 
         with torch.no_grad():
-            for param, w in zip(model.parameters(), W_global):
+            for param, w in zip(model.parameters(), W_global_anchor):
                 param.copy_(w)
 
         test_record = []
@@ -1836,13 +1876,18 @@ if __name__ == '__main__':
 
         for round_idx in range(args.comm_round):
             logger.info(f"ADMM round {round_idx}")
+            # W_global is RAW; W_global_prev captures the previous-round raw
+            # aggregate for the σ-rule's dual residual `σ·‖W_g^{k+1}-W_g^k‖`.
             W_global_prev = [w.detach().clone() for w in W_global]
 
-            # Snapshot z^k for BB Lipschitz estimate (only used by lipschitz mode)
+            # Snapshot z^k for BB Lipschitz estimate (only used by lipschitz
+            # mode). Use the ANCHOR (what the local solve sees) so the
+            # Lipschitz constant L̂ reflects the curvature around the point
+            # where the local solve actually operates.
             z_curr_bb = None
             grad_global_curr = None
             if sigma_mode == "online_convex_bal_lipschitz":
-                z_curr_bb = [w.detach().clone() for w in W_global]
+                z_curr_bb = [w.detach().clone() for w in W_global_anchor]
 
             # -----------------------------------------
             # 1) Local primal step: update each w_i^{k+1}
@@ -1875,14 +1920,15 @@ if __name__ == '__main__':
                         dataidxs, noise_level
                     )
 
-                # BB Lipschitz: per-client task-grad pass at z^k = W_global,
+                # BB Lipschitz: per-client task-grad pass at z^k = anchor,
                 # accumulated alpha-weighted into grad_global_curr. Done BEFORE
                 # the local solve so model state at z^k is preserved for the
                 # gradient. local_admm_train's `reset` init will overwrite the
-                # model again, so this leaves no residue.
+                # model again, so this leaves no residue. Evaluated at the
+                # ANCHOR (W_global_anchor) so L̂ matches the local-solve frame.
                 if sigma_mode == "online_convex_bal_lipschitz":
                     grad_i = compute_task_grad_at_z(
-                        model, train_dl_local, W_global, bb_criterion, device,
+                        model, train_dl_local, W_global_anchor, bb_criterion, device,
                     )
                     if grad_global_curr is None:
                         grad_global_curr = [
@@ -1897,7 +1943,7 @@ if __name__ == '__main__':
                 result = local_admm_train(
                     model=model,
                     train_dl_local=train_dl_local,
-                    w_global=W_global,
+                    w_global=W_global_anchor,
                     pi_local=P_b_initial[sb],
                     sigma_lr=sigma_lr,
                     args=args,
@@ -1919,6 +1965,9 @@ if __name__ == '__main__':
             # -----------------------------------------
             # 2) Global primal step: update w^{k+1}
             # -----------------------------------------
+            # W_global is the RAW aggregate; the σ-rule's residual computation
+            # below consumes it directly (unshifted, unsmoothed) so OGD on
+            # log σ sees a clean signal.
             W_global = generate_W_global(
                 args.n_parties,
                 W_b_initial,
@@ -1928,31 +1977,36 @@ if __name__ == '__main__':
                 l2_lambda
             )
 
-            # Server-side EMA: W_global_ema ← β_g·W_global_ema + (1−β_g)·W_global,
-            # then substitute W_global := W_global_ema so everything
-            # downstream (model copy for test eval, dual update, next-round
-            # local solve anchor, next-round BB Lipschitz snapshot) sees the
-            # smoothed aggregate. The raw W_global from this aggregation is
-            # only used to feed the EMA — clients never broadcast against
-            # the raw aggregate after round 0.
+            # Hybrid server-side EMA: maintain W_global_ema across rounds and
+            # use it as W_global_anchor (the algorithm's actual working state),
+            # but keep W_global itself as the raw aggregate for the σ-rule.
+            # See the long block in the init section for design rationale and
+            # change history.
             if use_global_w_ema:
                 with torch.no_grad():
                     for buf, w_new in zip(W_global_ema, W_global):
                         buf.mul_(global_w_ema_beta).add_(
                             (1.0 - global_w_ema_beta) * w_new.detach()
                         )
-                W_global = [buf.detach().clone() for buf in W_global_ema]
+                W_global_anchor = [buf.detach().clone() for buf in W_global_ema]
+            else:
+                W_global_anchor = W_global
 
+            # Model state for test eval: use the anchor — this is the
+            # consensus model the algorithm is enforcing clients toward.
             with torch.no_grad():
-                for param, w in zip(model.parameters(), W_global):
+                for param, w in zip(model.parameters(), W_global_anchor):
                     param.copy_(w)
 
             # -----------------------------------------
             # 3) Dual step: update pi_i^{k+1}
             # -----------------------------------------
+            # Dual enforces w_i = w_anchor (the constraint the local solve
+            # is actually targeting). Using W_global_anchor here keeps the
+            # dual update consistent with what the local solve sees.
             with torch.no_grad():
                 for sb in range(args.n_parties):
-                    for pi, wi, wg in zip(P_b_initial[sb], W_b_initial[sb], W_global):
+                    for pi, wi, wg in zip(P_b_initial[sb], W_b_initial[sb], W_global_anchor):
                         pi.add_(sigma_lr * (wi - wg))
 
             # -----------------------------------------
