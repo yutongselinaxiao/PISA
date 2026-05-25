@@ -1396,19 +1396,27 @@ def online_convex_bal_update_u(
 ):
     """
     Online update for u = log(sigma) with loss
-        0.5 * (u - (log(primal_res) - log(dual_base)))^2
+        L(u) = (u - target)^2,   target = log(primal_res) - log(dual_base)
+
+    Gradient = 2 * (u - target). This matches `_online.py`'s
+    `online_convex_bal_update_u` convention (and the `online_convex_bal_lipschitz`
+    variant in this file), so the two pipelines compute identical effective
+    σ-update steps for the same `eta_u`. Pre-2026-05-25 this function used
+    grad = (u-target) with loss = 0.5*(u-target)^2 — a 2× smaller step than
+    `_online.py`. Fixed for theorem alignment (Theorem 3 / Assumption 3 in
+    the OGD-on-σ proof uses the (u-target)^2 form).
     """
     primal_clip = torch.clamp(primal_res.detach(), min=eps)
     dual_clip = torch.clamp(dual_base.detach(), min=eps)
 
     target = torch.log(primal_clip) - torch.log(dual_clip)
-    grad_u = u - target
+    grad_u = 2.0 * (u - target)
     grad_u = torch.clamp(grad_u, -G_clip, G_clip)
 
     with torch.no_grad():
         u_new = u - eta_u * grad_u
         u_new = torch.clamp(u_new, min=u_min, max=u_max)
-        loss_val = 0.5 * (u - target).pow(2)
+        loss_val = (u - target).pow(2)
 
     return u_new.detach(), loss_val.detach(), target.detach(), grad_u.detach()
 
@@ -2114,16 +2122,27 @@ if __name__ == '__main__':
                     u_sigma = torch.tensor(math.log(max(sigma_lr, eps_val)), device=device)
 
                 elif sigma_mode == "online_convex_bal":
-                    # Diminishing step size: eta_k = eta_u / sqrt(k+1)
-                    # Required for O(sqrt(K)) regret in online convex optimization
-                    # Satisfies: sum eta_k = inf (exploration), sum eta_k^2 < inf (convergence)
-                    # eta_k = eta_u / math.sqrt(round_idx + 1.0)
-                    eta_k = eta_u
+                    # Diminishing step size — required for Theorem 3 / Assumption 3
+                    # (sublinear regret of OGD on convex losses with η_k → 0). The
+                    # `eta_u_decay` flag selects the schedule; default 'none' keeps
+                    # the prior constant-eta behavior. Pre-2026-05-25 this branch
+                    # hardcoded eta_k = eta_u (only the `_lipschitz` branch wired
+                    # the decay); fixed for theorem alignment + parity with that
+                    # branch.
+                    sigma_update_step += 1
+                    if eta_u_decay == "inverse":
+                        eta_u_eff = eta_u / sigma_update_step
+                    elif eta_u_decay == "inv_sqrt":
+                        eta_u_eff = eta_u / math.sqrt(sigma_update_step)
+                    elif eta_u_decay == "textbook_sc":
+                        eta_u_eff = 1.0 / (2.0 * sigma_update_step)
+                    else:
+                        eta_u_eff = eta_u
                     u_new, sigma_loss, sigma_target, sigma_grad = online_convex_bal_update_u(
                         u_sigma,
                         primal_smooth,
                         dual_smooth,
-                        eta_u=eta_k,
+                        eta_u=eta_u_eff,
                         u_min=math.log(sigma_min),
                         u_max=math.log(sigma_max),
                         eps=eps_val,
